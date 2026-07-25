@@ -370,7 +370,10 @@ def build_exit_candidates(client: BitkubClient, asset_balances: dict, current_pr
         if sl_price is None:
             # Calculate ATR‑based stop‑loss if ATR available
             if atr_at_entry > 0:
-                sl_price = entry_price - (atr_at_entry * config.ATR_STOP_MULTIPLIER)
+                atr_sl_price = entry_price - (atr_at_entry * config.ATR_STOP_MULTIPLIER)
+                pct_sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
+                # [FIX] ป้องกัน SL แคบเกินไป เลือกจุดที่ห่างจากราคาซื้อมากกว่า
+                sl_price = min(atr_sl_price, pct_sl_price)
             else:
                 sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
         # Hard‑stop safety price (flash crash protection)
@@ -1289,9 +1292,17 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
 
     # คำนวณขีดจำกัด SL และ TP ขาเข้าอ้างอิง ATR
     if atr > 0:
-        sl_price = entry_price - (atr * 1.5)
+        atr_sl_price = entry_price - (atr * 1.5)
+        pct_sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
+        # [FIX] ป้องกัน SL แคบเกินไปในเหรียญที่ผันผวนต่ำ (ATR เล็ก) จนราคาลงนิดเดียวก็โดน Stop Loss
+        # เลือกจุดตัดขาดทุนที่ห่างจากราคาซื้อมากกว่า (ปลอดภัยกว่า) ระหว่าง ATR-based กับ Percentage-based
+        if atr_sl_price < pct_sl_price:
+            sl_price = atr_sl_price
+            sl_desc = f"ATR-based (entry - 1.5*ATR: {sl_price:,.4f})"
+        else:
+            sl_price = pct_sl_price
+            sl_desc = f"Percentage-based floor ({config.STOP_LOSS_RATE*100:.1f}%: {sl_price:,.4f}) – ATR แคบเกินไป"
         tp_price = entry_price + (atr * 3.0)
-        sl_desc = f"ATR-based (entry - 1.5*ATR: {sl_price:,.4f})"
         tp_desc = f"ATR-based (entry + 3.0*ATR: {tp_price:,.4f})"
     else:
         sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
@@ -1381,7 +1392,7 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         mark_traded(opportunity["symbol"])
         detail = f"Skipped live buy because {open_order_count} open order(s) already exist"
         print(detail)
-        notify_trade(notifier, "[LIVE] Buy skipped", opportunity, detail)
+        # [FIX] ไม่ส่ง Telegram เมื่อซื้อไม่สำเร็จ/ถูกข้าม – แจ้งเตือนเฉพาะซื้อสำเร็จเท่านั้น
         return
     current_order_type = config.ORDER_TYPE_BUY
     current_post_only = config.POST_ONLY
@@ -1420,7 +1431,7 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
             mark_traded(opportunity["symbol"])
             detail = f"Buy FAILED {opportunity.get('symbol')} – Missing order ID"
             print(detail)
-            notify_trade(notifier, "[LIVE] Buy failed", opportunity, detail)
+            # [FIX] ไม่ส่ง Telegram เมื่อซื้อไม่สำเร็จ – แจ้งเตือนเฉพาะซื้อสำเร็จเท่านั้น
             try:
                 trade_logger.log_trade({
                     "timestamp": datetime.now().isoformat(),
@@ -1449,9 +1460,16 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
             print(f"[🔥 Filled Price] ดึงราคา fill จริงจาก order_res ได้สำเร็จ: {entry_price:,.4f} THB")
             # Recalculate SL and TP based on actual entry price
             if atr > 0:
-                sl_price = entry_price - (atr * 1.5)
+                atr_sl_price = entry_price - (atr * 1.5)
+                pct_sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
+                # [FIX] ใช้จุดตัดขาดทุนที่ห่างกว่าเสมอ ป้องกัน SL แคบเกินไป
+                if atr_sl_price < pct_sl_price:
+                    sl_price = atr_sl_price
+                    sl_desc = f"ATR-based (entry - 1.5*ATR: {sl_price:,.4f})"
+                else:
+                    sl_price = pct_sl_price
+                    sl_desc = f"Percentage-based floor ({config.STOP_LOSS_RATE*100:.1f}%: {sl_price:,.4f}) – ATR แคบเกินไป"
                 tp_price = entry_price + (atr * 3.0)
-                sl_desc = f"ATR-based (entry - 1.5*ATR: {sl_price:,.4f})"
                 tp_desc = f"ATR-based (entry + 3.0*ATR: {tp_price:,.4f})"
             else:
                 sl_price = entry_price * (1 - config.STOP_LOSS_RATE)
@@ -1511,7 +1529,7 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         error_code = order_res.get('error')
         detail = f"Buy FAILED {opportunity.get('symbol')} – Error {error_code}: {order_res.get('message') or 'No message'}"
         print(detail)
-        notify_trade(notifier, "[LIVE] Buy failed", opportunity, detail)
+        # [FIX] ไม่ส่ง Telegram เมื่อซื้อไม่สำเร็จ – แจ้งเตือนเฉพาะซื้อสำเร็จเท่านั้น
         try:
             trade_logger.log_trade({
                 "timestamp": datetime.now().isoformat(),
