@@ -115,6 +115,23 @@ class BitkubClient:
             print(f"[Warning] Could not fetch tickers: {e}")
             return {}
 
+    def get_symbols(self) -> dict:
+        """Fetch all trading symbols and their metadata (e.g. 'source': 'exchange'/'broker').
+
+        [FIX] ใช้เพื่อกรองเหรียญ broker-source ออกก่อนส่งคำสั่งซื้อ/ขาย เพราะ
+        place-bid/place-ask ไม่รองรับเหรียญ source=broker (Bitkub error code 61)
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v3/market/symbols",
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            print(f"[Warning] Could not fetch symbols: {e}")
+            return {"error": -1, "result": []}
+
     def get_depth(self, symbol: str, limit: int = 10) -> dict:
         """Fetch market depth (order book) for a symbol."""
         parts = symbol.upper().split("_")
@@ -424,23 +441,6 @@ class BitkubClient:
                 headers=headers,
                 timeout=self.request_timeout,
             )
-            # Validate price before proceeding
-            if entry_price <= 0:
-                print(f"[BUY REJECT] Invalid price {entry_price} for {opportunity['symbol']}")
-                detail = f"Buy rejected due to invalid price {entry_price}"
-                notify_trade(notifier, "[LIVE] Buy rejected", opportunity, detail)
-                return
-            open_order_count = get_open_order_count(client, opportunity["symbol"])
-            print("[Attempting BUY...]")
-            print(f"[Debug] Attempting BUY for {opportunity['symbol']} – open orders: {open_order_count}, THB balance: {thb_balance}, order size (THB): {amount_thb}")
-            if open_order_count > 0:
-                mark_traded(opportunity["symbol"])
-                detail = f"Skipped live buy because {open_order_count} open order(s) already exist"
-                print(detail)
-                notify_trade(notifier, "[LIVE] Buy skipped", opportunity, detail)
-                return
-            current_order_type = config.ORDER_TYPE_BUY
-            current_post_only = config.POST_ONLYserver_time()
             return response.json()
         except Exception as e:
             return {"error": -1, "message": f"Connection failed: {e}", "result": []}

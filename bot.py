@@ -69,6 +69,12 @@ consecutive_losses = 0
 last_buy_date = None
 last_chance_scan_minute = None
 
+# [FIX] แคชรายชื่อเหรียญ source=broker เพื่อกันไม่ให้ส่งคำสั่งซื้อ/ขายเหรียญที่
+# place-bid/place-ask ไม่รองรับ (Bitkub error code 61: "doesn't support broker coins")
+broker_source_coins = set()
+broker_source_last_refresh = 0.0
+BROKER_SOURCE_REFRESH_SECONDS = 3600  # รีเฟรชทุก 1 ชั่วโมงพอ เพราะ source ของเหรียญไม่เปลี่ยนบ่อย
+
 STATE_FILE = "state.json"
 
 
@@ -199,7 +205,39 @@ def mark_traded(symbol: str):
     last_trade_at[symbol] = time.time()
 
 
+def refresh_broker_source_coins(client: BitkubClient, force: bool = False):
+    """[FIX] ดึงรายชื่อเหรียญที่ source='broker' มาแคชไว้ เพื่อกรองไม่ให้บอทพยายาม
+    ส่ง place-bid/place-ask กับเหรียญกลุ่มนี้ (ระบบจะตอบ error 61 เสมอ เพราะ
+    Bitkub ไม่รองรับการเทรดเหรียญ broker-source ผ่าน endpoint นี้)
+    """
+    global broker_source_coins, broker_source_last_refresh
+    now = time.time()
+    if not force and broker_source_coins and (now - broker_source_last_refresh) < BROKER_SOURCE_REFRESH_SECONDS:
+        return broker_source_coins
+
+    try:
+        res = client.get_symbols()
+        if res.get("error") == 0:
+            result = res.get("result", [])
+            new_set = set()
+            for item in result:
+                if isinstance(item, dict) and str(item.get("source", "")).lower() == "broker":
+                    base = item.get("base_asset") or ""
+                    if base:
+                        new_set.add(base.upper())
+            if new_set or not broker_source_coins:
+                broker_source_coins = new_set
+            broker_source_last_refresh = now
+            if new_set:
+                print(f"[Info] Broker-source coins (ข้าม ไม่ซื้อ/ขาย): {sorted(new_set)}")
+    except Exception as e:
+        print(f"[Warning] Could not refresh broker-source coin list: {e}")
+    return broker_source_coins
+
+
 def get_scan_symbols(client: BitkubClient, tickers: dict) -> list:
+    refresh_broker_source_coins(client)
+
     if config.SCAN_SYMBOLS:
         return config.SCAN_SYMBOLS[: config.MAX_SCAN_SYMBOLS]
 
@@ -210,12 +248,18 @@ def get_scan_symbols(client: BitkubClient, tickers: dict) -> list:
     for ticker_key, ticker in tickers.items():
         if not ticker_key.upper().startswith("THB_") or not isinstance(ticker, dict):
             continue
+        symbol = ticker_key_to_symbol(ticker_key)
+        coin = symbol.split("_")[0].upper()
+        # [FIX] ข้ามเหรียญ broker-source เพราะ place-bid/place-ask จะ error 61 เสมอ
+        if coin in broker_source_coins:
+            continue
         volume = get_ticker_volume_thb(ticker)
-        thb_pairs.append((volume, ticker_key_to_symbol(ticker_key)))
+        thb_pairs.append((volume, symbol))
 
     thb_pairs.sort(reverse=True)
     symbols = [symbol for _, symbol in thb_pairs]
     return symbols[: config.MAX_SCAN_SYMBOLS] or [config.SYMBOL]
+
 
 
 def estimate_trade_edge(df, signal: str, spread_rate: float = 0.0) -> dict:
@@ -1263,6 +1307,8 @@ def execute_sell(client, notifier, opportunity):
         mark_traded(opportunity["symbol"])
         detail = f"Live sell failed: {order_res.get('message') or order_res.get('error')}"
         print(detail)
+        if order_res.get("error") == 61:
+            print(f"[Info] {opportunity['symbol'].upper()} เป็นเหรียญ broker-source ต้องขายผ่านแอป Bitkub เอง บอทจัดการผ่าน API ไม่ได้")
         notify_trade(notifier, "[LIVE] Sell failed", opportunity, detail)
         try:
             trade_logger.log_trade({
@@ -1284,6 +1330,12 @@ def execute_sell(client, notifier, opportunity):
 
 def execute_buy(client, notifier, opportunity, thb_balance, total_value):
     global paper_thb, paper_balances, last_buy_date
+
+    # [FIX] กันเหรียญ broker-source หลุดมาจากที่อื่น (เช่น SCAN_SYMBOLS ที่ตั้งเอง)
+    # เพราะ place-bid จะ error 61 เสมอสำหรับเหรียญกลุ่มนี้
+    if not config.DRY_RUN and opportunity.get("coin") in broker_source_coins:
+        print(f"[Info] ข้ามซื้อ {opportunity['symbol'].upper()} เพราะเป็นเหรียญ broker-source (ไม่รองรับ place-bid)")
+        return
 
     amount_thb = calculate_position_size(thb_balance, total_value)
     estimated_coin = amount_thb / opportunity["price"]
@@ -1529,6 +1581,11 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         error_code = order_res.get('error')
         detail = f"Buy FAILED {opportunity.get('symbol')} – Error {error_code}: {order_res.get('message') or 'No message'}"
         print(detail)
+        # [FIX] ถ้าเจอ error 61 (broker-source coin) ให้เติมเข้าแบล็คลิสต์ทันที
+        # กันกรณีตัวกรองจาก /market/symbols ยังไม่ทัน หรือพลาดไป จะได้ไม่ลองซื้อซ้ำอีก
+        if error_code == 61:
+            broker_source_coins.add(opportunity.get("coin", "").upper())
+            print(f"[Info] เพิ่ม {opportunity.get('coin')} เข้ารายการเหรียญ broker-source แล้ว จะไม่พยายามซื้ออีก")
         # [FIX] ไม่ส่ง Telegram เมื่อซื้อไม่สำเร็จ – แจ้งเตือนเฉพาะซื้อสำเร็จเท่านั้น
         try:
             trade_logger.log_trade({
