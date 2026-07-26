@@ -115,6 +115,26 @@ class BitkubClient:
             print(f"[Warning] Could not fetch tickers: {e}")
             return {}
 
+    def get_symbols_info(self) -> dict:
+        """Fetch metadata for all symbols (e.g. 'source': 'exchange' or 'broker').
+
+        Coins with source == 'broker' cannot be traded via place-bid/place-ask
+        (Bitkub Error 61: "This endpoint doesn't support broker coins").
+        Returns a dict keyed by symbol (e.g. 'BLEND_THB') -> full symbol info dict.
+        """
+        try:
+            response = requests.get(
+                f"{self.base_url}/api/v3/market/symbols",
+                timeout=self.request_timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            result = data.get("result", []) if isinstance(data, dict) else []
+            return {item.get("symbol", "").upper(): item for item in result if isinstance(item, dict)}
+        except Exception as e:
+            print(f"[Warning] Could not fetch symbols info: {e}")
+            return {}
+
     def get_depth(self, symbol: str, limit: int = 10) -> dict:
         """Fetch market depth (order book) for a symbol."""
         parts = symbol.upper().split("_")
@@ -313,7 +333,7 @@ class BitkubClient:
         path = "/api/v3/market/place-bid"
         method = "POST"
         payload = {
-            "sym": symbol.upper(),
+            "sym": symbol.lower(),
             "amt": float(amount),
             "rat": float(rate) if order_type.lower() == "limit" else 0,
             "typ": order_type.lower(),

@@ -75,7 +75,7 @@ PARTIAL_TAKE_PROFIT_RATE = 0.020
 TAKE_PROFIT_RATE = 0.025
 TRAILING_STOP_RATE = 0.012
 TRAILING_MIN_PROFIT_RATE = 0.010
-MIN_NET_PROFIT_RATE = 0.018  # [FIX] เพิ่มจาก 0.010 เพื่อกันไม่ให้กำไรถูกกินด้วยค่าธรรมเนียมตอนขาขึ้น
+MIN_NET_PROFIT_RATE = 0.03  # [FIX] ผู้ใช้ขอปรับเป็น 3% (จากเดิม 1.8%) กันขายกำไรจิ๊บจ๊อยแล้วเสียค่าธรรมเนียมซ้ำซ้อน
 MIN_NET_EDGE = 0.012
 PROFIT_LOCK_THRESHOLD = 0.001
 PROFIT_LOCK_TRAILING_RATE = 0.0025
@@ -124,12 +124,12 @@ POST_ONLY = False
 # Trade filters
 MAX_SPREAD_RATE = 0.0150
 MIN_24H_VOLUME_THB = 500000
-TRADE_COOLDOWN_SECONDS = 180
+TRADE_COOLDOWN_SECONDS = 10800  # [FIX] ขยายจาก 180 วิ (3 นาที) เป็น 3 ชั่วโมง กันซื้อ-ขายถี่เกินไปหลังขายกำไรน้อย
 MIN_HOLD_MINUTES = 30.0
 REQUIRE_PRICE_ABOVE_EMA50_1H = False
 REQUIRE_1H_UPTREND = False
 
-SELL_CONFIRM_MIN_CONDITIONS = 1
+SELL_CONFIRM_MIN_CONDITIONS = 2  # [FIX] เพิ่มจาก 1 เป็น 2 เพื่อกันขายด้วยสัญญาณเดียวที่อาจเป็นแค่สัญญาณรบกวนระยะสั้น
 SELL_RSI_THRESHOLD = 45.0
 
 ADX_SIDEWAY_THRESHOLD = 15.0
@@ -147,6 +147,21 @@ PANIC_SELL_PRICE_DROP = 0.03
 DIP_ENTRY_ENABLED = True
 DIP_MIN_PULLBACK_RATE = 0.015   # ต้องต่ำกว่าจุดสูงสุด (Donchian 20) อย่างน้อย 1.5% ถึงจะซื้อได้
 DIP_MAX_PULLBACK_RATE = 0.12    # แต่ถ้าย่อลงมาเกิน 12% ถือว่าอาจเป็นขาลงจริง ไม่ใช่แค่ย่อ ให้งดซื้อ
+
+# Big‑dip / Mean‑reversion buy — [NEW] ซื้อตอนราคาลงเยอะๆ (ตกหนัก) แล้วรอสัญญาณเด้งกลับก่อนเข้าซื้อ
+# ทำงานเป็นทางเลือกที่สอง (OR) คู่กับ DIP_ENTRY ด้านบน: ถ้าราคาตกลึกกว่านี้ + มีสัญญาณเด้งกลับ ก็เข้าซื้อได้เช่นกัน
+BIG_DIP_BUY_ENABLED = True
+BIG_DIP_LOOKBACK_1H_CANDLES = 72    # ใช้จุดสูงสุดใน 1h ย้อนหลัง ~72 แท่ง (3 วัน) เป็นจุดอ้างอิง "ก่อนตก"
+BIG_DIP_MIN_DROP_RATE = 0.15        # ราคาต้องต่ำกว่าจุดสูงสุดนั้นอย่างน้อย 15% ถึงจะเข้าเงื่อนไข "ตกหนัก"
+BIG_DIP_RSI_OVERSOLD = 35.0         # RSI ต้องเคยลงมาต่ำกว่านี้ (oversold) ในช่วงที่ผ่านมา
+BIG_DIP_REQUIRE_REBOUND_CANDLES = 3 # ต้องเห็นแท่งเขียวยืนยันว่าเริ่มเด้งขึ้นกี่แท่งล่าสุด
+
+# No‑loss exit policy — [NEW] ผู้ใช้เลือก: ห้ามขายขาดทุน ยกเว้นถือนานเกินกำหนดแล้วยังไม่ฟื้น
+# เมื่อเปิดใช้: stop loss / hard stop / trailing stop / panic sell / technical exit ทุกชนิด
+# จะ "ถือรอ" แทนการขาย ถ้าขายแล้วขาดทุนสุทธิหลังหักค่าธรรมเนียม (net_rate < MIN_NET_PROFIT_RATE)
+# ยกเว้นถือครองเกิน MAX_HOLD_DAYS_LOSS_CAPITULATION วันแล้วยังไม่กำไร ถึงจะยอมขายขาดทุน (safety net สุดท้าย)
+NO_LOSS_EXIT_POLICY_ENABLED = True
+MAX_HOLD_DAYS_LOSS_CAPITULATION = 45   # อยู่ระหว่าง 30-60 วันตามที่ผู้ใช้ระบุ
 
 # Last‑chance scanner settings
 LAST_CHANCE_MIN_CONFIDENCE = 60.0

@@ -69,6 +69,12 @@ consecutive_losses = 0
 last_buy_date = None
 last_chance_scan_minute = None
 
+# [NEW] Cache ของเหรียญที่เทรดผ่าน place-bid/place-ask ไม่ได้ (source = broker, Bitkub Error 61)
+# กันไม่ให้ bot พยายามซื้อ/ขายเหรียญกลุ่มนี้ซ้ำๆ โดยเปล่าประโยชน์
+_broker_only_symbols_cache = set()
+_broker_only_symbols_timestamp = 0
+_BROKER_SYMBOLS_REFRESH_SECONDS = 3600  # รีเฟรชรายชื่อทุก 1 ชั่วโมง
+
 STATE_FILE = "state.json"
 
 
@@ -199,9 +205,36 @@ def mark_traded(symbol: str):
     last_trade_at[symbol] = time.time()
 
 
+def get_broker_only_symbols(client: BitkubClient) -> set:
+    """คืนชุดของ symbol (เช่น 'BLEND_THB') ที่มี source='broker' ซึ่งเทรดผ่าน
+    place-bid/place-ask ไม่ได้ (Bitkub Error 61) แคชผลไว้ 1 ชั่วโมงกันยิง API ถี่เกินไป
+    """
+    global _broker_only_symbols_cache, _broker_only_symbols_timestamp
+    now = time.time()
+    if _broker_only_symbols_cache and (now - _broker_only_symbols_timestamp) < _BROKER_SYMBOLS_REFRESH_SECONDS:
+        return _broker_only_symbols_cache
+    try:
+        symbols_info = client.get_symbols_info()
+        broker_symbols = {
+            sym for sym, info in symbols_info.items()
+            if str(info.get("source", "")).lower() == "broker"
+        }
+        if broker_symbols:
+            _broker_only_symbols_cache = broker_symbols
+            _broker_only_symbols_timestamp = now
+            print(f"[ℹ️ Broker Coins] พบเหรียญ source=broker ที่เทรดผ่าน API ไม่ได้ {len(broker_symbols)} ตัว: {sorted(broker_symbols)}")
+        return _broker_only_symbols_cache
+    except Exception as e:
+        print(f"[Warning] Failed to fetch broker-only symbols: {e}")
+        return _broker_only_symbols_cache
+
+
 def get_scan_symbols(client: BitkubClient, tickers: dict) -> list:
+    broker_only = get_broker_only_symbols(client)
+
     if config.SCAN_SYMBOLS:
-        return config.SCAN_SYMBOLS[: config.MAX_SCAN_SYMBOLS]
+        filtered = [s for s in config.SCAN_SYMBOLS if s.upper() not in broker_only]
+        return filtered[: config.MAX_SCAN_SYMBOLS]
 
     if not tickers:
         tickers = client.get_all_tickers()
@@ -210,8 +243,11 @@ def get_scan_symbols(client: BitkubClient, tickers: dict) -> list:
     for ticker_key, ticker in tickers.items():
         if not ticker_key.upper().startswith("THB_") or not isinstance(ticker, dict):
             continue
+        symbol = ticker_key_to_symbol(ticker_key)
+        if symbol.upper() in broker_only:
+            continue
         volume = get_ticker_volume_thb(ticker)
-        thb_pairs.append((volume, ticker_key_to_symbol(ticker_key)))
+        thb_pairs.append((volume, symbol))
 
     thb_pairs.sort(reverse=True)
     symbols = [symbol for _, symbol in thb_pairs]
@@ -556,15 +592,46 @@ def build_exit_candidates(client: BitkubClient, asset_balances: dict, current_pr
                 value_thb = amount * price
                 is_partial = False
 
-            # [FIX] ห้ามขายถ้ากำไรสุทธิติดลบ ยกเว้น Stop Loss, Trailing Stop, Panic Sell
-            emergency_exits = ("stop loss", "trailing stop", "panic sell")
-            is_emergency = any(e in reason for e in emergency_exits)
-            if not is_emergency and net_rate < config.MIN_NET_PROFIT_RATE:
-                print(
-                    f"[{coin}] Skip exit [{reason}]: net_rate {net_rate*100:.2f}% < min net profit {config.MIN_NET_PROFIT_RATE*100:.2f}%"
-                    f" | HOLD เพื่อรอกำไรมากขึ้น"
+            # [NEW] นโยบายห้ามขายขาดทุน + ห้ามขายกำไรจิ๊บจ๊อย (NO_LOSS_EXIT_POLICY_ENABLED):
+            # ไม่ขาย ไม่ว่าเหตุผลใด จนกว่ากำไรสุทธิ (net_rate) จะถึง MIN_NET_PROFIT_RATE
+            # ยกเว้น: ถ้า "ขาดทุนจริง" (net_rate < 0) และถือครองนานเกิน MAX_HOLD_DAYS_LOSS_CAPITULATION วันแล้วยังไม่ฟื้น
+            # ถึงจะยอมขายขาดทุน (safety net สุดท้ายกันเงินจมตลอดไป) — กำไรน้อยแต่ยังเป็นบวก ไม่ถูกบังคับขายด้วยเวลา
+            below_target = net_rate < config.MIN_NET_PROFIT_RATE
+            if below_target and config.NO_LOSS_EXIT_POLICY_ENABLED:
+                is_true_loss = net_rate < 0
+                held_minutes_now = _position_held_minutes(coin)
+                held_days_now = (held_minutes_now / 1440.0) if held_minutes_now is not None else None
+                capitulation_ready = (
+                    is_true_loss
+                    and held_days_now is not None
+                    and held_days_now >= config.MAX_HOLD_DAYS_LOSS_CAPITULATION
                 )
-                continue
+                if capitulation_ready:
+                    reason = f"{reason} + time-based loss capitulation (held {held_days_now:.1f}d)"
+                    sell_reasons.append(
+                        f"⏳ ถือครองเกิน {config.MAX_HOLD_DAYS_LOSS_CAPITULATION} วัน ({held_days_now:.1f}d) "
+                        f"ยังไม่ฟื้น จำเป็นต้องขายขาดทุน"
+                    )
+                else:
+                    held_desc = f"{held_days_now:.1f}d" if held_days_now is not None else "N/A"
+                    status = "ขาดทุน" if is_true_loss else "กำไรยังไม่ถึงเป้า"
+                    print(
+                        f"[{coin}] HOLD ({status}) [{reason}]: net_rate {net_rate*100:.2f}% < min {config.MIN_NET_PROFIT_RATE*100:.2f}% "
+                        f"| held {held_desc}"
+                        + (f" < capitulation limit {config.MAX_HOLD_DAYS_LOSS_CAPITULATION}d" if is_true_loss else "")
+                        + " | รอกำไรถึงเป้า หรือครบกำหนดเวลา (กรณีขาดทุน)"
+                    )
+                    continue
+            elif below_target:
+                # พฤติกรรมเดิม (ใช้เมื่อ NO_LOSS_EXIT_POLICY_ENABLED = False): อนุญาตขายขาดทุนเฉพาะกรณีฉุกเฉิน
+                emergency_exits = ("stop loss", "trailing stop", "panic sell")
+                is_emergency = any(e in reason for e in emergency_exits)
+                if not is_emergency:
+                    print(
+
+                        f"[{coin}] Skip exit [{reason}]: net_rate {net_rate*100:.2f}% < min net profit {config.MIN_NET_PROFIT_RATE*100:.2f}%"
+                    )
+                    continue
 
             # [NEW] พิมพ์เหตุผลการขายอย่างละเอียด
             print(f"[{coin}] 🔔 SELL SIGNAL detected:")
@@ -760,6 +827,47 @@ def is_trending(df):
 
 def is_sideway(df):
     return df.get("adx", pd.Series()).iloc[-1] < config.ADX_SIDEWAY_THRESHOLD if "adx" in df.columns else False
+
+# [NEW] ยืนยันว่าราคาที่ตกลงมาเยอะเริ่ม "เด้งกลับ" แล้ว ไม่ใช่แค่หยุดตกชั่วคราว
+# ใช้สำหรับกลยุทธ์ "ซื้อตอนราคาลงเยอะๆ" (Big Dip / Mean Reversion Buy)
+def check_bottom_reversal(df, oversold_rsi=None, rebound_candles=None):
+    if oversold_rsi is None:
+        oversold_rsi = config.BIG_DIP_RSI_OVERSOLD
+    if rebound_candles is None:
+        rebound_candles = config.BIG_DIP_REQUIRE_REBOUND_CANDLES
+
+    lookback = max(rebound_candles + 3, 6)
+    if len(df) < lookback:
+        return False, "ข้อมูลไม่พอสำหรับตรวจสอบการเด้งกลับ"
+
+    recent = df.iloc[-lookback:]
+    row_now = df.iloc[-1]
+    row_prev = df.iloc[-2]
+
+    # เงื่อนไข 1: RSI เคย oversold ใน N แท่งล่าสุด และตอนนี้กำลังไต่ขึ้น (ไม่ใช่ตกต่อ)
+    was_oversold = (recent["rsi"] <= oversold_rsi).any()
+    rsi_recovering = row_now["rsi"] > row_prev["rsi"]
+
+    # เงื่อนไข 2: แท่งเขียวติดต่อกัน (ราคาปิด > ราคาเปิด) ยืนยันแรงซื้อกลับมา
+    last_n = df.iloc[-rebound_candles:]
+    green_candles = (last_n["close"] > last_n["open"]).sum()
+    enough_green = green_candles >= max(1, rebound_candles - 1)
+
+    # เงื่อนไข 3: MACD histogram กำลังพลิกขึ้น (โมเมนตัมขาลงเริ่มอ่อนแรง)
+    macd_turning_up = row_now["macd_hist"] > row_prev["macd_hist"]
+
+    conditions_met = sum([was_oversold and rsi_recovering, enough_green, macd_turning_up])
+
+    if was_oversold and enough_green and conditions_met >= 2:
+        return True, (
+            f"RSI เคย oversold + ราคาฟื้นตัว {green_candles}/{rebound_candles} แท่งเขียว, "
+            f"RSI now={row_now['rsi']:.1f}, MACD hist turning up={macd_turning_up}"
+        )
+    return False, (
+        f"ยังไม่เห็นสัญญาณเด้งกลับชัดเจน (oversold={was_oversold}, green={green_candles}/{rebound_candles}, "
+        f"rsi_recovering={rsi_recovering}, macd_turning_up={macd_turning_up})"
+    )
+
 
 # Reversal detection over consecutive bars
 def check_reversal_confirmation(df, rsi_drop=config.REVERSAL_RSI_DROP, rsi_max=config.REVERSAL_RSI_MAX, bars=config.REVERSAL_CONFIRM_CONSECUTIVE_BARS):
@@ -987,26 +1095,48 @@ def scan_market(client: BitkubClient, strategy, tickers: dict, asset_balances: d
             log_buy_rejection(symbol, "low volume", spread=spread_rate, volume_ratio=volume_ratio, adx=adx_15m, net_edge=None, score=None, expected=None, fee=None)
             continue
 
-        # [NEW] Dip‑entry filter — ต้องซื้อตอนราคา "ย่อตัว" จากจุดสูงสุดล่าสุด ไม่ใช่ตอนราคาพุ่งขึ้นไปแตะจุดสูงสุด
+        # [NEW] Dip‑entry filter — มี 2 ทางเลือกในการเข้าซื้อ (OR):
+        #   A) Pullback entry: ราคาย่อตัวเล็กน้อย (1.5%-12%) จากจุดสูงสุด แล้วซื้อตามเทรนด์
+        #   B) Big‑dip entry: ราคาลงเยอะๆ (>=15% จากจุดสูงสุดใน 3 วัน) แต่มีสัญญาณเด้งกลับชัดเจนแล้ว
         # แก้ปัญหา bot ซื้อไล่ราคาแพงแล้วราคากลับตัวลงมาโดนตัดขาดทุนทันที
+        entry_path = None
+        entry_detail = ""
+
         if config.DIP_ENTRY_ENABLED:
             recent_high = safe_float(row_15m_latest.get("donchian_high", 0))
             if recent_high > 0:
                 pullback_rate = (recent_high - price) / recent_high
-                if pullback_rate < config.DIP_MIN_PULLBACK_RATE:
-                    log_buy_rejection(
-                        symbol,
-                        f"too close to recent high (pullback {pullback_rate*100:.2f}% < {config.DIP_MIN_PULLBACK_RATE*100:.1f}% required) - รอราคาย่อก่อน",
-                        spread=spread_rate, adx=adx_15m,
-                    )
-                    continue
-                if pullback_rate > config.DIP_MAX_PULLBACK_RATE:
-                    log_buy_rejection(
-                        symbol,
-                        f"pulled back too far ({pullback_rate*100:.2f}% > {config.DIP_MAX_PULLBACK_RATE*100:.1f}%) - อาจเป็นขาลงจริง ไม่ใช่แค่ย่อ",
-                        spread=spread_rate, adx=adx_15m,
-                    )
-                    continue
+                if config.DIP_MIN_PULLBACK_RATE <= pullback_rate <= config.DIP_MAX_PULLBACK_RATE:
+                    entry_path = "pullback"
+                    entry_detail = f"pullback {pullback_rate*100:.2f}% จาก high {recent_high:.4f}"
+
+        if entry_path is None and config.BIG_DIP_BUY_ENABLED and not df_1h.empty:
+            lookback_1h = min(config.BIG_DIP_LOOKBACK_1H_CANDLES, len(df_1h))
+            recent_high_1h = safe_float(df_1h["high"].iloc[-lookback_1h:].max())
+            if recent_high_1h > 0:
+                drop_rate = (recent_high_1h - price) / recent_high_1h
+                if drop_rate >= config.BIG_DIP_MIN_DROP_RATE:
+                    reversed_, reversal_detail = check_bottom_reversal(df_15m)
+                    if reversed_:
+                        entry_path = "big_dip"
+                        entry_detail = f"big dip {drop_rate*100:.2f}% จาก high {recent_high_1h:.4f} | {reversal_detail}"
+                    else:
+                        log_buy_rejection(
+                            symbol,
+                            f"big dip {drop_rate*100:.2f}% แต่ยังไม่มีสัญญาณเด้งกลับ ({reversal_detail}) - รอยืนยันก่อน",
+                            spread=spread_rate, adx=adx_15m,
+                        )
+
+        if config.DIP_ENTRY_ENABLED or config.BIG_DIP_BUY_ENABLED:
+            if entry_path is None:
+                log_buy_rejection(
+                    symbol,
+                    "ไม่เข้าเงื่อนไขซื้อทั้ง pullback entry และ big dip entry - ราคายังใกล้จุดสูงสุดเกินไป",
+                    spread=spread_rate, adx=adx_15m,
+                )
+                continue
+            else:
+                print(f"[{symbol.upper()}] ✅ Entry path: {entry_path} | {entry_detail}")
 
         # 4. New entry scoring system (Score >= config.MIN_BUY_SCORE required)
         # Compute edge early to avoid UnboundLocalError
@@ -1057,6 +1187,7 @@ def scan_market(client: BitkubClient, strategy, tickers: dict, asset_balances: d
                 "volume_thb": volume_thb,
                 "atr": atr,
                 "score": new_score,
+                "entry_path": entry_path,
                 **edge,
             }
 
@@ -1305,6 +1436,15 @@ def execute_sell(client, notifier, opportunity):
 
 def execute_buy(client, notifier, opportunity, thb_balance, total_value):
     global paper_thb, paper_balances, last_buy_date
+
+    # [NEW] Safety guard: กันเหรียญ source=broker หลุดเข้ามาซื้อจากทางอื่น (เช่น last-chance scanner)
+    # เหรียญกลุ่มนี้เทรดผ่าน place-bid ไม่ได้เลย (Bitkub Error 61)
+    broker_only = get_broker_only_symbols(client)
+    if opportunity.get("symbol", "").upper() in broker_only:
+        msg = f"[⏭️ Skip Buy] {opportunity.get('symbol','').upper()} เป็นเหรียญ source=broker เทรดผ่าน API ไม่ได้ (Bitkub Error 61)"
+        print(msg)
+        mark_traded(opportunity["symbol"])
+        return
 
     amount_thb = calculate_position_size(thb_balance, total_value)
     estimated_coin = amount_thb / opportunity["price"]
