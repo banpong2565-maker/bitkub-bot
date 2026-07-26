@@ -54,6 +54,7 @@ from strategy import (
 from telegram_notifier import TelegramNotifier
 import ai_last_chance_scanner
 import trade_logger
+import dip_buy_strategy  # กลยุทธ์เสริม: ซื้อตัวที่ตกมากสุด/ขายเมื่อกำไรหลังหักค่าธรรมเนียม (แยกอิสระ, ไม่แตะ logic เดิม)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -1716,6 +1717,7 @@ def run_bot():
         sys.exit(1)
 
     load_state()
+    dip_buy_strategy.load_dip_state()  # กลยุทธ์เสริม: โหลด state ของตัวเอง (แยกไฟล์ ไม่ยุ่งกับ state.json เดิม)
 
     client = BitkubClient(
         config.API_KEY,
@@ -1756,6 +1758,13 @@ def run_bot():
             thb_balance, asset_balances, total_value = get_balances(client, current_prices)
             sync_position_state(client, asset_balances, current_prices)
             print(f"THB balance: {thb_balance:,.2f} | Portfolio value: {total_value:,.2f} THB")
+
+            # กลยุทธ์เสริม (แยกอิสระจากกลยุทธ์หลักด้านล่างทั้งหมด): dip-buy
+            dip_buy_strategy.run_dip_buy_cycle(client, notifier, tickers, current_prices, thb_balance)
+
+            # รีเฟรชยอดคงเหลือหลัง dip-buy เผื่อมีการใช้เงินไป – กันกลยุทธ์หลักด้านล่าง
+            # คำนวณซื้อโดยอ้างอิงยอดเงินเก่าที่อาจถูกใช้ไปแล้วบางส่วน (ป้องกันซื้อเกินยอดจริง)
+            thb_balance, asset_balances, total_value = get_balances(client, current_prices)
 
             # ตรวจสอบขีดจำกัดการขาดทุนรายวัน (Daily Loss Limit 3%)
             server_day, _ = get_server_day_and_time(client)

@@ -59,6 +59,28 @@ ALLOW_ADD_TO_POSITION = False
 MAX_POSITION_VALUE_RATE = 0.25
 MAX_PORTFOLIO_RISK_RATE = 0.02
 
+# ---------------------------------------------------------------------
+# Dip-Buy Strategy (เสริมแยกต่างหาก – ไม่ยุ่งกับกลยุทธ์หลักด้านบน)
+# ซื้อเหรียญที่ราคาตก 24 ชม. มากที่สุดก่อน ถ้าซื้อไม่ได้ไล่ตัวถัดไปที่ตกรองลงมา
+# ขายเมื่อราคาพลิกเป็นบวกหลังหักค่าธรรมเนียมแล้วเท่านั้น (ไม่ขาดทุน)
+# ปิดใช้งานเป็นค่าเริ่มต้น (False) เพื่อไม่ให้กระทบพฤติกรรมบอทเดิม
+# ตั้งค่าได้ผ่าน Environment Variable (เช่นบน Railway) โดยไม่ต้องแก้โค้ด/redeploy
+# ---------------------------------------------------------------------
+DIP_BUY_ENABLED = os.getenv("DIP_BUY_ENABLED", "False").strip().lower() in ("true", "1", "yes")
+
+# True = ใช้ยอด THB ที่มีอยู่ ณ ขณะนั้นทั้งหมด (หักเงินสำรองตาม DIP_BUY_RESERVE_THB)
+# False = ใช้จำนวนคงที่ตาม DIP_BUY_AMOUNT_THB ทุกครั้ง
+DIP_BUY_USE_ALL_AVAILABLE_THB = os.getenv("DIP_BUY_USE_ALL_AVAILABLE_THB", "True").strip().lower() in ("true", "1", "yes")
+
+# เงินสำรองขั้นต่ำที่ "ไม่" เอาไปซื้อ dip-buy เผื่อไว้ให้กลยุทธ์หลักใช้ (ใช้ก็ต่อเมื่อ
+# DIP_BUY_USE_ALL_AVAILABLE_THB=True) ตั้งเป็น 0 หากต้องการใช้เงินทั้งหมดจริง ๆ
+DIP_BUY_RESERVE_THB = float(os.getenv("DIP_BUY_RESERVE_THB", "0"))
+
+# จำนวนเงิน THB คงที่ต่อครั้ง (ใช้เมื่อ DIP_BUY_USE_ALL_AVAILABLE_THB=False เท่านั้น)
+DIP_BUY_AMOUNT_THB = float(os.getenv("DIP_BUY_AMOUNT_THB", "300"))
+
+DIP_BUY_MAX_CANDIDATES_TO_TRY = 10  # ไล่ลองซื้อสูงสุดกี่อันดับ (จากตกมากสุดไล่ลงมา) ต่อรอบ
+
 # ATR and stop‑loss configuration
 ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 2.0
