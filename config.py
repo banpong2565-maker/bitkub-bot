@@ -53,7 +53,7 @@ ORDER_TIMEOUT_SECONDS = 30
 TRADING_FEE_RATE = 0.0025
 MIN_EXPECTED_PROFIT_RATE = 0.003
 PROFIT_LOOKBACK_CANDLES = 8
-MIN_TRADE_VALUE_THB = 10.0  # [FIX] ลดจาก 50 → 10 (ขั้นต่ำจริงของ Bitkub) เพื่อให้ซื้อได้ตามเงินที่มีในพอร์ต แทนที่จะข้ามการเทรดไปเลย
+MIN_TRADE_VALUE_THB = 50.0
 MAX_OPEN_POSITIONS = 3
 ALLOW_ADD_TO_POSITION = False
 MAX_POSITION_VALUE_RATE = 0.25
@@ -64,8 +64,12 @@ ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 2.0
 ATR_TRAILING_MULTIPLIER = 1.8
 ENTRY_SCORE_THRESHOLD = 6
-HARD_STOP_EXTRA_DROP_RATE = 0.015
-STOP_LOSS_RATE = 0.035
+# [FIX] ผู้ใช้ขอขยาย stop loss เป็น ~30% เพื่อลดการขายขาดทุนจากความผันผวนระยะสั้น
+# หมายเหตุ: เดิม HARD_STOP_EXTRA_DROP_RATE (1.5%) แคบกว่า STOP_LOSS_RATE (3.5%) มาก
+# ทำให้ "hard stop" ทำงานตัดขาดทุนก่อน stop loss ปกติเสมอ (ราคาตกแค่ 1.5% ก็ขายแล้ว)
+# ตอนนี้ปรับให้ hard stop กว้างกว่า stop loss เล็กน้อย เพื่อเป็นแค่ตาข่ายนิรภัยกรณี flash crash จริง ๆ
+HARD_STOP_EXTRA_DROP_RATE = 0.32
+STOP_LOSS_RATE = 0.30
 STOP_LOSS_CONFIRM_MINUTES = 5
 PARTIAL_TAKE_PROFIT_RATE = 0.020
 TAKE_PROFIT_RATE = 0.025
@@ -137,6 +141,12 @@ MIN_VOLUME_RATIO = 0.30
 PANIC_SELL_ENABLED = True
 PANIC_SELL_VOLUME_SPIKE = 3.0
 PANIC_SELL_PRICE_DROP = 0.03
+
+# Dip‑entry filter — [NEW] ป้องกันการซื้อไล่ราคาที่จุดสูงสุด (buying the top)
+# บังคับให้ราคาต้อง "ย่อตัวลงมา" จากจุดสูงสุดล่าสุดก่อนถึงจะเข้าซื้อ (ซื้อตอนราคาย่อ ไม่ใช่ตอนราคาพุ่ง)
+DIP_ENTRY_ENABLED = True
+DIP_MIN_PULLBACK_RATE = 0.015   # ต้องต่ำกว่าจุดสูงสุด (Donchian 20) อย่างน้อย 1.5% ถึงจะซื้อได้
+DIP_MAX_PULLBACK_RATE = 0.12    # แต่ถ้าย่อลงมาเกิน 12% ถือว่าอาจเป็นขาลงจริง ไม่ใช่แค่ย่อ ให้งดซื้อ
 
 # Last‑chance scanner settings
 LAST_CHANCE_MIN_CONFIDENCE = 60.0
