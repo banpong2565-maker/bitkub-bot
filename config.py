@@ -81,6 +81,14 @@ DIP_BUY_AMOUNT_THB = float(os.getenv("DIP_BUY_AMOUNT_THB", "300"))
 
 DIP_BUY_MAX_CANDIDATES_TO_TRY = 10  # ไล่ลองซื้อสูงสุดกี่อันดับ (จากตกมากสุดไล่ลงมา) ต่อรอบ
 
+# [NEW] หน้าต่างเวลาที่ใช้จัดอันดับ "เหรียญตกมากสุด" — เดิม fix อยู่ที่ 24 ชม. (1440 นาที)
+# เพราะใช้ percentChange ของ ticker Bitkub ตรงๆ ซึ่งเป็นค่าคงที่ 24 ชม. เปลี่ยนไม่ได้
+# ตอนนี้ปรับให้คำนวณเองจากแท่งเทียนแทน จะได้กำหนดหน้าต่างเวลาให้แคบกว่า 24 ชม. ได้
+# ตั้งค่าได้ผ่าน Environment Variable เหมือนตัวอื่นๆ ด้านบน
+DIP_BUY_LOOKBACK_MINUTES = int(os.getenv("DIP_BUY_LOOKBACK_MINUTES", "240"))  # ค่าเริ่มต้น 4 ชม. (จากเดิม 24 ชม.)
+DIP_BUY_CANDLE_RESOLUTION = os.getenv("DIP_BUY_CANDLE_RESOLUTION", "15")  # ความละเอียดแท่งเทียนที่ใช้คำนวณ (นาที)
+DIP_BUY_MAX_SYMBOLS_TO_SCAN = int(os.getenv("DIP_BUY_MAX_SYMBOLS_TO_SCAN", "40"))  # จำกัดจำนวนเหรียญที่ดึงแท่งเทียนต่อรอบ (เรียงวอลุ่มมากสุดก่อน) กันยิง API เยอะเกินไป
+
 # ATR and stop‑loss configuration
 ATR_PERIOD = 14
 ATR_STOP_MULTIPLIER = 2.0

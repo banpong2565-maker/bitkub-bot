@@ -53,7 +53,12 @@ def save_dip_state() -> None:
 
 
 def _rank_by_biggest_drop(tickers: dict, exclude_symbols: set) -> list:
-    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลง 24 ชม. จากตกมากสุด -> น้อยสุด."""
+    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลง 24 ชม. จากตกมากสุด -> น้อยสุด.
+
+    หมายเหตุ: ใช้ percentChange ของ ticker Bitkub ตรงๆ ซึ่งเป็นหน้าต่างเวลา 24 ชม. ตายตัว
+    เปลี่ยนความยาวหน้าต่างเวลาไม่ได้ ถ้าต้องการหน้าต่างเวลาที่แคบกว่านี้ ให้ใช้
+    _rank_by_biggest_drop_custom_window() แทน (ควบคุมด้วย config.DIP_BUY_LOOKBACK_MINUTES)
+    """
     import bot  # lazy import กัน circular import กับ bot.py
 
     ranked = []
@@ -78,6 +83,72 @@ def _rank_by_biggest_drop(tickers: dict, exclude_symbols: set) -> list:
             continue
 
         ranked.append({"symbol": symbol, "coin": bot.base_coin(symbol), "percent_change": pct, "price": price})
+
+    ranked.sort(key=lambda x: x["percent_change"])  # ตกมากสุด (ค่าติดลบมากสุด) มาก่อน
+    return ranked
+
+
+def _rank_by_biggest_drop_custom_window(client, tickers: dict, exclude_symbols: set) -> list:
+    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลงในหน้าต่างเวลาที่กำหนดเอง
+    (config.DIP_BUY_LOOKBACK_MINUTES แทนที่จะ fix ที่ 24 ชม.) จากตกมากสุด -> น้อยสุด
+
+    วิธีการ: ดึงแท่งเทียนย้อนหลังจาก /tradingview/history มาคำนวณเอง แทนการใช้
+    ticker.percentChange (ซึ่งเป็น 24 ชม. ตายตัว) เพื่อจำกัดจำนวน API call ต่อรอบ
+    จะกรองเฉพาะเหรียญที่วอลุ่ม 24 ชม. >= config.MIN_24H_VOLUME_THB ก่อน แล้วเอาแค่
+    top config.DIP_BUY_MAX_SYMBOLS_TO_SCAN ตัวที่วอลุ่มสูงสุดมาคำนวณแท่งเทียน
+    """
+    import bot  # lazy import กัน circular import กับ bot.py
+    import config as _config
+
+    # 1) กรองเบื้องต้นด้วยวอลุ่ม (ข้อมูลจาก ticker เดียว ไม่ต้องยิง API เพิ่ม) กันเหรียญเงียบ/สภาพคล่องต่ำ
+    candidates = []
+    for ticker_key, ticker in tickers.items():
+        if not ticker_key.upper().startswith("THB_") or not isinstance(ticker, dict):
+            continue
+        symbol = bot.ticker_key_to_symbol(ticker_key)
+        if symbol.upper() in exclude_symbols:
+            continue
+        price = bot.safe_float(ticker.get("last"))
+        if price <= 0:
+            continue
+        volume_thb = bot.get_ticker_volume_thb(ticker)
+        if volume_thb < _config.MIN_24H_VOLUME_THB:
+            continue
+        candidates.append({"symbol": symbol, "coin": bot.base_coin(symbol), "price": price, "volume_thb": volume_thb})
+
+    # 2) เอาแค่ top N ตัวที่วอลุ่มสูงสุดมาคำนวณแท่งเทียน กัน API เยอะเกินไป
+    candidates.sort(key=lambda x: x["volume_thb"], reverse=True)
+    candidates = candidates[: max(1, _config.DIP_BUY_MAX_SYMBOLS_TO_SCAN)]
+
+    # 3) คำนวณจำนวนแท่งเทียนที่ต้องใช้ให้ครอบคลุมหน้าต่างเวลาที่ตั้งไว้
+    try:
+        res_minutes = int(_config.DIP_BUY_CANDLE_RESOLUTION)
+    except (TypeError, ValueError):
+        res_minutes = 15
+    candles_needed = max(2, int(_config.DIP_BUY_LOOKBACK_MINUTES / max(res_minutes, 1)) + 2)
+
+    ranked = []
+    for c in candidates:
+        try:
+            data = client.get_candles(c["symbol"], resolution=_config.DIP_BUY_CANDLE_RESOLUTION, limit=candles_needed)
+            if not isinstance(data, dict) or data.get("s") != "ok":
+                continue
+            closes = data.get("c") or []
+            if len(closes) < 2:
+                continue
+            # ราคาอ้างอิงต้นหน้าต่างเวลา = แท่งเก่าสุดที่ยังอยู่ในช่วง lookback (ตัวแรกสุดของอาเรย์)
+            window_start_price = bot.safe_float(closes[0])
+            if window_start_price <= 0:
+                continue
+            current_price = c["price"]
+            pct = ((current_price - window_start_price) / window_start_price) * 100
+            ranked.append({
+                "symbol": c["symbol"], "coin": c["coin"],
+                "percent_change": pct, "price": current_price,
+            })
+        except Exception as e:
+            print(f"[DipBuy] ⚠️ ดึงแท่งเทียน {c['symbol'].upper()} ไม่สำเร็จ (ข้าม): {e}")
+            continue
 
     ranked.sort(key=lambda x: x["percent_change"])  # ตกมากสุด (ค่าติดลบมากสุด) มาก่อน
     return ranked
@@ -123,7 +194,7 @@ def _attempt_buy(client, notifier, candidate: dict, available_thb: float) -> boo
         save_dip_state()
 
         detail = (
-            f"[DipBuy][DRY RUN] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน 24 ชม.) "
+            f"[DipBuy][DRY RUN] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน {config.DIP_BUY_LOOKBACK_MINUTES} นาทีที่ผ่านมา) "
             f"จำนวน {coin_bought:.8f} @ {price:,.4f} THB (ใช้เงิน {amount_thb:,.2f} THB)"
         )
         print(detail)
@@ -159,7 +230,7 @@ def _attempt_buy(client, notifier, candidate: dict, available_thb: float) -> boo
     save_dip_state()
 
     detail = (
-        f"[DipBuy][LIVE] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน 24 ชม.) "
+        f"[DipBuy][LIVE] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน {config.DIP_BUY_LOOKBACK_MINUTES} นาทีที่ผ่านมา) "
         f"จำนวน {coin_bought:.8f} @ {fill_price:,.4f} THB"
     )
     print(detail)
@@ -247,7 +318,13 @@ def run_dip_buy_cycle(client, notifier, tickers: dict, current_prices: dict, ava
         import bot  # lazy import กัน circular import กับ bot.py
         broker_only = bot.get_broker_only_symbols(client) if not config.DRY_RUN else set()
 
-        ranked = _rank_by_biggest_drop(tickers, exclude_symbols=broker_only)
+        # [NEW] ใช้หน้าต่างเวลาที่กำหนดเอง (config.DIP_BUY_LOOKBACK_MINUTES) แทน 24 ชม. ตายตัว
+        # ถ้าดึงแท่งเทียนไม่สำเร็จ (เช่น network error) จะ fallback ไปใช้ percentChange 24 ชม.เดิม
+        ranked = _rank_by_biggest_drop_custom_window(client, tickers, exclude_symbols=broker_only)
+        if not ranked:
+            print("[DipBuy] ⚠️ คำนวณหน้าต่างเวลาแบบกำหนดเองไม่สำเร็จ ใช้ percentChange 24 ชม. แทนชั่วคราว")
+            ranked = _rank_by_biggest_drop(tickers, exclude_symbols=broker_only)
+
         max_try = getattr(config, "DIP_BUY_MAX_CANDIDATES_TO_TRY", 10)
         for candidate in ranked[:max_try]:
             if _attempt_buy(client, notifier, candidate, available_thb):
