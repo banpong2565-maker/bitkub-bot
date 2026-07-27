@@ -49,6 +49,13 @@ LOOP_INTERVAL_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 10
 ORDER_TIMEOUT_SECONDS = 30
 
+# [NEW] ปิดการ "เปิดออเดอร์ซื้อใหม่" ของระบบที่ 1 (กลยุทธ์หลัก multi-coin technical + AI Last
+# Chance Scanner) ทั้งหมด — ใช้แค่ Dip-Buy Strategy (ระบบที่ 2) เพียงอย่างเดียวในการซื้อ
+# ยังคงปล่อยให้ระบบที่ 1 "ขาย/ปิด position เดิม" ที่อาจถืออยู่ก่อนหน้าได้ตามปกติ (ผ่าน
+# no-loss exit policy เดิม) เพื่อไม่ให้เหรียญที่ถืออยู่แล้วค้างอยู่โดยไม่มีระบบดูแลเลย
+# ถ้าพอร์ตไม่มี position เหลือจากระบบเดิมแล้ว ตั้งค่านี้ไว้จะไม่มีผลกระทบอะไรเพิ่มเติม
+MAIN_STRATEGY_ENABLED = False
+
 # Technical analysis & risk settings
 TRADING_FEE_RATE = 0.0025
 MIN_EXPECTED_PROFIT_RATE = 0.003
@@ -85,7 +92,7 @@ DIP_BUY_MAX_CANDIDATES_TO_TRY = 10  # ไล่ลองซื้อสูงส
 # ต้องติดลบอย่างน้อยกี่ % (ตามที่กระดาน Bitkub แสดง) ถึงจะถือว่าเป็น "dip" ที่น่าซื้อ
 # ป้องกันการซื้อเหรียญที่แทบไม่ขยับ ซึ่งจะเสียค่าธรรมเนียมซื้อ-ขายไปฟรีๆ โดยไม่ได้ประโยชน์จริง
 # (ค่าเป็นลบ เช่น -15 หมายถึงต้องติดลบอย่างน้อย 15% ถึงจะเข้าเงื่อนไข)
-DIP_BUY_MIN_DROP_PERCENT = -15.0
+DIP_BUY_MIN_DROP_PERCENT = -12.0
 
 # ATR and stop‑loss configuration
 ATR_PERIOD = 14

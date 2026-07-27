@@ -1804,7 +1804,9 @@ def run_bot():
             elif sell_candidates:
                 execute_sell(client, notifier, sell_candidates[0])
             elif buy_candidates:
-                if disable_buys:
+                if not config.MAIN_STRATEGY_ENABLED:
+                    pass  # [Dip-Buy Only Mode] ระบบที่ 1 ถูกปิดการซื้อ ใช้แค่ Dip-Buy Strategy เพียงอย่างเดียว
+                elif disable_buys:
                     print("[🛑 Blocked] ข้ามคำสั่งซื้อ: ถูกระงับชั่วคราวเนื่องจากความปลอดภัย (ลิมิตพอร์ตรายวัน หรือ แพ้ติดต่อกัน)")
                 elif thb_balance < config.MIN_TRADE_VALUE_THB:
                     print("No trade: ยอดเงิน THB ในพอร์ตไม่เพียงพอสำหรับการเทรด")
@@ -1816,33 +1818,35 @@ def run_bot():
                 print("No trade: no signal passed score or fee filter")
 
                 # AI Last Chance Scanner (Non-Intrusive Mode)
-                server_day, server_dt = get_server_day_and_time(client)
-                current_hour = server_dt.hour
-                current_minute = server_dt.minute
+                # [Dip-Buy Only Mode] เป็นอีกช่องทางการซื้อของระบบที่ 1 เช่นกัน ปิดพร้อมกัน
+                if config.MAIN_STRATEGY_ENABLED:
+                    server_day, server_dt = get_server_day_and_time(client)
+                    current_hour = server_dt.hour
+                    current_minute = server_dt.minute
 
-                # Check activation conditions
-                in_time_window = (22 <= current_hour < 24)
-                no_buy_executed_today = (last_buy_date != server_day)
-                no_open_positions = (open_positions == 0)
-                no_normal_buy_signal = (not buy_candidates)
+                    # Check activation conditions
+                    in_time_window = (22 <= current_hour < 24)
+                    no_buy_executed_today = (last_buy_date != server_day)
+                    no_open_positions = (open_positions == 0)
+                    no_normal_buy_signal = (not buy_candidates)
 
-                if in_time_window and no_buy_executed_today and no_open_positions and no_normal_buy_signal:
-                    global last_chance_scan_minute
-                    current_minute_key = (server_day, current_hour, current_minute // 5)
+                    if in_time_window and no_buy_executed_today and no_open_positions and no_normal_buy_signal:
+                        global last_chance_scan_minute
+                        current_minute_key = (server_day, current_hour, current_minute // 5)
 
-                    if last_chance_scan_minute != current_minute_key:
-                        print(f"[🔍 AI Last Chance Scanner] Activating scanner at {server_dt.strftime('%H:%M:%S')}...")
-                        last_chance_scan_minute = current_minute_key
+                        if last_chance_scan_minute != current_minute_key:
+                            print(f"[🔍 AI Last Chance Scanner] Activating scanner at {server_dt.strftime('%H:%M:%S')}...")
+                            last_chance_scan_minute = current_minute_key
 
-                        scanner_opt = ai_last_chance_scanner.run_last_chance_scan_v2(client)
-                        if scanner_opt:
-                            if disable_buys:
-                                print("[🛑 Blocked] AI Last Chance Scanner BUY skipped: safety limit (daily loss or consecutive losses)")
-                            elif thb_balance < config.MIN_TRADE_VALUE_THB:
-                                print("No trade: ยอดเงิน THB ไม่เพียงพอสำหรับ AI Last Chance Scanner")
-                            else:
-                                print(f"[🚀 AI Last Chance Scanner] Executing BUY for {scanner_opt['symbol'].upper()}...")
-                                execute_buy(client, notifier, scanner_opt, thb_balance, total_value)
+                            scanner_opt = ai_last_chance_scanner.run_last_chance_scan_v2(client)
+                            if scanner_opt:
+                                if disable_buys:
+                                    print("[🛑 Blocked] AI Last Chance Scanner BUY skipped: safety limit (daily loss or consecutive losses)")
+                                elif thb_balance < config.MIN_TRADE_VALUE_THB:
+                                    print("No trade: ยอดเงิน THB ไม่เพียงพอสำหรับ AI Last Chance Scanner")
+                                else:
+                                    print(f"[🚀 AI Last Chance Scanner] Executing BUY for {scanner_opt['symbol'].upper()}...")
+                                    execute_buy(client, notifier, scanner_opt, thb_balance, total_value)
 
         except KeyboardInterrupt:
             print("\nBot stopped by user")
