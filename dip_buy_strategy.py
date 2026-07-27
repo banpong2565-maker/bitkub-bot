@@ -1,7 +1,16 @@
 # dip_buy_strategy.py
 """
-กลยุทธ์เสริม: ซื้อเหรียญที่ราคาตก (24 ชม.) มากที่สุดก่อน หากซื้อไม่สำเร็จให้ไล่ตัวถัดไป
-ที่ตกรองลงมา และจะขายเมื่อราคากลับมาเป็นบวก (หักค่าธรรมเนียมซื้อ-ขายแล้วไม่ขาดทุน) เท่านั้น
+กลยุทธ์เสริม: ทุกรอบที่บอทสแกน (ทุก config.LOOP_INTERVAL_SECONDS วินาที) จะไล่ดูเหรียญ
+ทั้งกระดาน THB แล้วเลือกเหรียญที่ "ติดลบมากที่สุด ณ ขณะนั้น" (ตาม % เปลี่ยนแปลงที่ Bitkub
+แสดงบนกระดานเอง ไม่ใช่คำนวณเองจากหน้าต่างเวลาตายตัว เพราะเหรียญอาจตกมาก่อนหน้านั้นแล้วก็ได้)
+มาซื้อก่อน หากซื้อไม่สำเร็จให้ไล่ตัวถัดไปที่ตกรองลงมา
+
+จะขายก็ต่อเมื่อครบทั้ง 2 เงื่อนไขพร้อมกัน:
+  1) % เปลี่ยนแปลงบนกระดานของเหรียญนั้นกลับมาเป็นบวกแล้ว (>= 0) เช่น ซื้อตอน -15% ต้องรอจน
+     ค่านี้ขยับกลับมาที่ 0% ขึ้นไปก่อน
+  2) กำไรสุทธิหลังหักค่าธรรมเนียมซื้อ-ขายแล้ว (เทียบราคาที่ซื้อมาจริง) ต้องเป็นบวกด้วย (ไม่ขาดทุน)
+เหรียญที่ตกไม่ถึงเกณฑ์ config.DIP_BUY_MIN_DROP_PERCENT หรือวอลุ่มต่ำกว่า config.MIN_24H_VOLUME_THB
+จะถูกข้าม ไม่นำมาซื้อ
 
 สำคัญ: โมดูลนี้แยกเป็นอิสระจาก bot.py โดยสิ้นเชิง
 - ไม่แก้ไข ไม่เรียกใช้ และไม่รบกวน scan_market(), execute_buy(), execute_sell()
@@ -53,11 +62,15 @@ def save_dip_state() -> None:
 
 
 def _rank_by_biggest_drop(tickers: dict, exclude_symbols: set) -> list:
-    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลง 24 ชม. จากตกมากสุด -> น้อยสุด.
+    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลงที่ "กระดาน" Bitkub แสดงอยู่จริง
+    (ticker.percentChange ของ Bitkub เอง) จากตกมากสุด -> น้อยสุด
 
-    หมายเหตุ: ใช้ percentChange ของ ticker Bitkub ตรงๆ ซึ่งเป็นหน้าต่างเวลา 24 ชม. ตายตัว
-    เปลี่ยนความยาวหน้าต่างเวลาไม่ได้ ถ้าต้องการหน้าต่างเวลาที่แคบกว่านี้ ให้ใช้
-    _rank_by_biggest_drop_custom_window() แทน (ควบคุมด้วย config.DIP_BUY_LOOKBACK_MINUTES)
+    นี่คือฟังก์ชันหลักที่ใช้จัดอันดับ "เหรียญติดลบมากที่สุดในกระดาน ณ ขณะที่สแกน" —
+    ไม่ได้จำกัดว่าเหรียญต้องตกภายในหน้าต่างเวลาที่กำหนดตายตัว (เช่น 1-2 ชม.ล่าสุด)
+    เพราะเหรียญอาจตกมาตั้งแต่ก่อนหน้านั้นแล้วก็ได้ สิ่งที่สำคัญคือ ณ เวลาที่บอทสแกน (ทุก
+    config.LOOP_INTERVAL_SECONDS วินาที) ตัวไหนติดลบมากที่สุดบนกระดาน ตัวนั้นถูกเลือกก่อน
+    กรองด้วยวอลุ่ม (config.MIN_24H_VOLUME_THB) และเกณฑ์ตกขั้นต่ำ (config.DIP_BUY_MIN_DROP_PERCENT)
+    ในขั้นถัดไปที่ run_dip_buy_cycle()
     """
     import bot  # lazy import กัน circular import กับ bot.py
 
@@ -82,73 +95,11 @@ def _rank_by_biggest_drop(tickers: dict, exclude_symbols: set) -> list:
         if price <= 0:
             continue
 
-        ranked.append({"symbol": symbol, "coin": bot.base_coin(symbol), "percent_change": pct, "price": price})
-
-    ranked.sort(key=lambda x: x["percent_change"])  # ตกมากสุด (ค่าติดลบมากสุด) มาก่อน
-    return ranked
-
-
-def _rank_by_biggest_drop_custom_window(client, tickers: dict, exclude_symbols: set) -> list:
-    """จัดอันดับเหรียญตลาด THB ตาม % เปลี่ยนแปลงในหน้าต่างเวลาที่กำหนดเอง
-    (config.DIP_BUY_LOOKBACK_MINUTES แทนที่จะ fix ที่ 24 ชม.) จากตกมากสุด -> น้อยสุด
-
-    วิธีการ: ดึงแท่งเทียนย้อนหลังจาก /tradingview/history มาคำนวณเอง แทนการใช้
-    ticker.percentChange (ซึ่งเป็น 24 ชม. ตายตัว) เพื่อจำกัดจำนวน API call ต่อรอบ
-    จะกรองเฉพาะเหรียญที่วอลุ่ม 24 ชม. >= config.MIN_24H_VOLUME_THB ก่อน แล้วเอาแค่
-    top config.DIP_BUY_MAX_SYMBOLS_TO_SCAN ตัวที่วอลุ่มสูงสุดมาคำนวณแท่งเทียน
-    """
-    import bot  # lazy import กัน circular import กับ bot.py
-    import config as _config
-
-    # 1) กรองเบื้องต้นด้วยวอลุ่ม (ข้อมูลจาก ticker เดียว ไม่ต้องยิง API เพิ่ม) กันเหรียญเงียบ/สภาพคล่องต่ำ
-    candidates = []
-    for ticker_key, ticker in tickers.items():
-        if not ticker_key.upper().startswith("THB_") or not isinstance(ticker, dict):
-            continue
-        symbol = bot.ticker_key_to_symbol(ticker_key)
-        if symbol.upper() in exclude_symbols:
-            continue
-        price = bot.safe_float(ticker.get("last"))
-        if price <= 0:
-            continue
         volume_thb = bot.get_ticker_volume_thb(ticker)
-        if volume_thb < _config.MIN_24H_VOLUME_THB:
-            continue
-        candidates.append({"symbol": symbol, "coin": bot.base_coin(symbol), "price": price, "volume_thb": volume_thb})
+        if volume_thb < config.MIN_24H_VOLUME_THB:
+            continue  # กันเหรียญเงียบ/สภาพคล่องต่ำ ที่ตัวเลข % เปลี่ยนแปลงอาจไม่น่าเชื่อถือ
 
-    # 2) เอาแค่ top N ตัวที่วอลุ่มสูงสุดมาคำนวณแท่งเทียน กัน API เยอะเกินไป
-    candidates.sort(key=lambda x: x["volume_thb"], reverse=True)
-    candidates = candidates[: max(1, _config.DIP_BUY_MAX_SYMBOLS_TO_SCAN)]
-
-    # 3) คำนวณจำนวนแท่งเทียนที่ต้องใช้ให้ครอบคลุมหน้าต่างเวลาที่ตั้งไว้
-    try:
-        res_minutes = int(_config.DIP_BUY_CANDLE_RESOLUTION)
-    except (TypeError, ValueError):
-        res_minutes = 15
-    candles_needed = max(2, int(_config.DIP_BUY_LOOKBACK_MINUTES / max(res_minutes, 1)) + 2)
-
-    ranked = []
-    for c in candidates:
-        try:
-            data = client.get_candles(c["symbol"], resolution=_config.DIP_BUY_CANDLE_RESOLUTION, limit=candles_needed)
-            if not isinstance(data, dict) or data.get("s") != "ok":
-                continue
-            closes = data.get("c") or []
-            if len(closes) < 2:
-                continue
-            # ราคาอ้างอิงต้นหน้าต่างเวลา = แท่งเก่าสุดที่ยังอยู่ในช่วง lookback (ตัวแรกสุดของอาเรย์)
-            window_start_price = bot.safe_float(closes[0])
-            if window_start_price <= 0:
-                continue
-            current_price = c["price"]
-            pct = ((current_price - window_start_price) / window_start_price) * 100
-            ranked.append({
-                "symbol": c["symbol"], "coin": c["coin"],
-                "percent_change": pct, "price": current_price,
-            })
-        except Exception as e:
-            print(f"[DipBuy] ⚠️ ดึงแท่งเทียน {c['symbol'].upper()} ไม่สำเร็จ (ข้าม): {e}")
-            continue
+        ranked.append({"symbol": symbol, "coin": bot.base_coin(symbol), "percent_change": pct, "price": price})
 
     ranked.sort(key=lambda x: x["percent_change"])  # ตกมากสุด (ค่าติดลบมากสุด) มาก่อน
     return ranked
@@ -194,7 +145,7 @@ def _attempt_buy(client, notifier, candidate: dict, available_thb: float) -> boo
         save_dip_state()
 
         detail = (
-            f"[DipBuy][DRY RUN] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน {config.DIP_BUY_LOOKBACK_MINUTES} นาทีที่ผ่านมา) "
+            f"[DipBuy][DRY RUN] ซื้อ {symbol.upper()} (ติดลบมากที่สุดบนกระดาน {candidate['percent_change']:.2f}%) "
             f"จำนวน {coin_bought:.8f} @ {price:,.4f} THB (ใช้เงิน {amount_thb:,.2f} THB)"
         )
         print(detail)
@@ -230,7 +181,7 @@ def _attempt_buy(client, notifier, candidate: dict, available_thb: float) -> boo
     save_dip_state()
 
     detail = (
-        f"[DipBuy][LIVE] ซื้อ {symbol.upper()} (ตก {candidate['percent_change']:.2f}% ใน {config.DIP_BUY_LOOKBACK_MINUTES} นาทีที่ผ่านมา) "
+        f"[DipBuy][LIVE] ซื้อ {symbol.upper()} (ติดลบมากที่สุดบนกระดาน {candidate['percent_change']:.2f}%) "
         f"จำนวน {coin_bought:.8f} @ {fill_price:,.4f} THB"
     )
     print(detail)
@@ -238,8 +189,13 @@ def _attempt_buy(client, notifier, candidate: dict, available_thb: float) -> boo
     return True
 
 
-def _attempt_sell(client, notifier, current_prices: dict) -> None:
-    """ขาย position ที่เปิดอยู่ ก็ต่อเมื่อกำไรหลังหักค่าธรรมเนียมซื้อ-ขายแล้ว (ไม่ขาดทุน)."""
+def _attempt_sell(client, notifier, current_prices: dict, tickers: dict) -> None:
+    """ขาย position ที่เปิดอยู่ ก็ต่อเมื่อเข้าเงื่อนไขทั้ง 2 ข้อพร้อมกัน:
+    1) % เปลี่ยนแปลงบนกระดาน (ticker.percentChange) ของเหรียญนั้นกลับมาเป็นบวกแล้ว (>= 0)
+       เช่น ตอนซื้อติดลบอยู่ -15% ต้องรอจนกว่าค่านี้จะขยับกลับมาที่ 0% ขึ้นไปก่อน
+    2) กำไรสุทธิหลังหักค่าธรรมเนียมซื้อ+ขายแล้ว (เทียบกับราคาที่เราซื้อมาจริง) ต้องเป็นบวกด้วย (ไม่ขาดทุน)
+    ถ้าไม่ครบทั้ง 2 ข้อ จะถือต่อไป ไม่ขาย
+    """
     import bot  # lazy import กัน circular import กับ bot.py
 
     if not dip_position:
@@ -254,6 +210,26 @@ def _attempt_sell(client, notifier, current_prices: dict) -> None:
     if not current_price or current_price <= 0:
         return
 
+    # เงื่อนไขที่ 1: % เปลี่ยนแปลงบนกระดานของเหรียญนี้ต้องกลับมาเป็นบวก (>= 0) แล้ว
+    ticker_key = bot.symbol_to_ticker_key(symbol)
+    ticker = tickers.get(ticker_key)
+    board_pct = None
+    if isinstance(ticker, dict):
+        board_pct = ticker.get("percentChange")
+        if board_pct is None:
+            board_pct = ticker.get("percent_change")
+        try:
+            board_pct = float(board_pct)
+        except (TypeError, ValueError):
+            board_pct = None
+
+    if board_pct is None:
+        return  # หาค่าบนกระดานไม่ได้รอบนี้ (เช่น ticker หาย) -> ข้ามไปก่อน ไม่ขาย
+
+    if board_pct < 0:
+        return  # ยังติดลบอยู่บนกระดาน -> ถือต่อ ไม่ขาย
+
+    # เงื่อนไขที่ 2: กำไรสุทธิหลังหักค่าธรรมเนียมซื้อ+ขาย (เทียบราคาที่เราซื้อมาจริง) ต้องเป็นบวก
     value_thb = amount * current_price
     fee = value_thb * config.TRADING_FEE_RATE
     net_received = value_thb - fee
@@ -261,14 +237,14 @@ def _attempt_sell(client, notifier, current_prices: dict) -> None:
     net_profit = net_received - cost_basis
 
     if net_profit <= 0:
-        return  # ยังไม่กำไรหลังหักค่าธรรมเนียม -> ถือต่อ ไม่ขาย
+        return  # กระดานบวกแล้วก็จริง แต่หักค่าธรรมเนียมแล้วยังไม่คุ้ม -> ถือต่อ ไม่ขาย
 
     if config.DRY_RUN:
         bot.paper_thb += net_received
         bot.paper_balances[coin] = 0.0
 
         detail = (
-            f"[DipBuy][DRY RUN] ขาย {symbol.upper()} กำไรสุทธิ {net_profit:,.2f} THB "
+            f"[DipBuy][DRY RUN] ขาย {symbol.upper()} (กระดานพลิกบวก {board_pct:.2f}%) กำไรสุทธิ {net_profit:,.2f} THB "
             f"(เข้า {entry_price:,.4f} -> ออก {current_price:,.4f})"
         )
         print(detail)
@@ -280,7 +256,7 @@ def _attempt_sell(client, notifier, current_prices: dict) -> None:
     order_res = client.place_ask(symbol=symbol, amount=amount, rate=0.0, order_type="market")
     if order_res.get("error") == 0:
         detail = (
-            f"[DipBuy][LIVE] ขาย {symbol.upper()} กำไรสุทธิ {net_profit:,.2f} THB "
+            f"[DipBuy][LIVE] ขาย {symbol.upper()} (กระดานพลิกบวก {board_pct:.2f}%) กำไรสุทธิ {net_profit:,.2f} THB "
             f"(เข้า {entry_price:,.4f} -> ออก {current_price:,.4f})"
         )
         print(detail)
@@ -303,7 +279,8 @@ def _notify(notifier, message: str) -> None:
 def run_dip_buy_cycle(client, notifier, tickers: dict, current_prices: dict, available_thb: float = 0.0) -> None:
     """จุดเข้าเดียวที่ bot.py เรียกใช้ต่อรอบ (เพิ่มเติมจากขั้นตอนเดิม ไม่แทนที่).
 
-    - ถ้ามี position เปิดอยู่: เช็คว่ากำไรหลังหักค่าธรรมเนียมหรือยัง ถ้าใช่ -> ขาย
+    - ถ้ามี position เปิดอยู่: เช็คว่ากระดานพลิกบวก (>= 0) แล้วหรือยัง และกำไรหลังหักค่าธรรมเนียมหรือยัง
+      ถ้าครบทั้ง 2 เงื่อนไข -> ขาย
     - ถ้าไม่มี position: จัดอันดับเหรียญตามที่ตกมากสุด แล้วไล่ซื้อทีละอันดับจนกว่าจะสำเร็จ
       โดยใช้ยอด THB ที่มีอยู่จริง ณ ขณะนั้น (available_thb) ตามค่า config ที่ตั้งไว้
     """
@@ -312,18 +289,21 @@ def run_dip_buy_cycle(client, notifier, tickers: dict, current_prices: dict, ava
 
     try:
         if dip_position:
-            _attempt_sell(client, notifier, current_prices)
+            _attempt_sell(client, notifier, current_prices, tickers)
             return
 
         import bot  # lazy import กัน circular import กับ bot.py
         broker_only = bot.get_broker_only_symbols(client) if not config.DRY_RUN else set()
 
-        # [NEW] ใช้หน้าต่างเวลาที่กำหนดเอง (config.DIP_BUY_LOOKBACK_MINUTES) แทน 24 ชม. ตายตัว
-        # ถ้าดึงแท่งเทียนไม่สำเร็จ (เช่น network error) จะ fallback ไปใช้ percentChange 24 ชม.เดิม
-        ranked = _rank_by_biggest_drop_custom_window(client, tickers, exclude_symbols=broker_only)
+        # จัดอันดับตาม % เปลี่ยนแปลงที่กระดาน Bitkub แสดงอยู่จริง ณ ขณะที่สแกนรอบนี้
+        # (ดูรายละเอียดที่คอมเมนต์ใน _rank_by_biggest_drop ด้านบน)
+        ranked = _rank_by_biggest_drop(tickers, exclude_symbols=broker_only)
+
+        min_drop_percent = getattr(config, "DIP_BUY_MIN_DROP_PERCENT", -15.0)
+        ranked = [c for c in ranked if c["percent_change"] <= min_drop_percent]
         if not ranked:
-            print("[DipBuy] ⚠️ คำนวณหน้าต่างเวลาแบบกำหนดเองไม่สำเร็จ ใช้ percentChange 24 ชม. แทนชั่วคราว")
-            ranked = _rank_by_biggest_drop(tickers, exclude_symbols=broker_only)
+            print(f"[DipBuy] ⏭️ ไม่มีเหรียญไหนตกถึงเกณฑ์ {min_drop_percent:.2f}% ในรอบนี้ ข้ามไปก่อน")
+            return
 
         max_try = getattr(config, "DIP_BUY_MAX_CANDIDATES_TO_TRY", 10)
         for candidate in ranked[:max_try]:
