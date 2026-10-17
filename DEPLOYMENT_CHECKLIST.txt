@@ -1,0 +1,13 @@
+V12.2 DEPLOYMENT CHECKLIST
+
+1. Backup V12.1.
+2. Run SUPABASE_FINAL_DB_AWARENESS_PATCH.sql in Supabase SQL Editor.
+3. Verify public.get_public_schema exists.
+4. Verify bot_decisions.learning_score exists.
+5. Deploy the V12.2 bot source/patch.
+6. Preserve existing .env and credentials.
+7. Restart the .sh service.
+8. Look for:
+   [DB-AWARENESS] Schema loaded: ...
+9. Verify recent bot_decisions rows contain Learning fields.
+10. Do not change spread/volume/V7 thresholds until audit data confirms a strategy issue.

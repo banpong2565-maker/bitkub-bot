@@ -1,0 +1,8 @@
+# ไฟล์นี้ระบุไฟล์ที่ไม่ควรอัปโหลดขึ้น GitHub (เพื่อความปลอดภัยของ API Keys)
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.log
+state.json
+*.zip
