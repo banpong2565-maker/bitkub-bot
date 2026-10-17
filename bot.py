@@ -2130,7 +2130,7 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
                 "entry_price": entry_price,
                 "highest_price": entry_price,
                 "atr_at_entry": atr,
-                "initial_amount": coin_bought,
+                "initial_amount": new_amount,
                 "cost_thb": actual_cost_thb,
                 "tp1_sold": False,
                 "tp2_sold": False,
@@ -2267,7 +2267,18 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         )
         if actual_price > 0:
             entry_price = actual_price
-            source = "weighted order history" if price_from_history else "order response/info"
+            exchange_price_available = any(
+                safe_float(candidate) > 0
+                for candidate in (
+                    result.get("rate"), result.get("rat"), result.get("avg_price"), result.get("avg"),
+                    info_result.get("rate"), info_result.get("rat"), info_result.get("avg_price"), info_result.get("avg"),
+                )
+            )
+            source = (
+                "weighted order history" if price_from_history
+                else "order response/info" if exchange_price_available
+                else "ticker fallback (not exchange-confirmed)"
+            )
             print(f"[🔥 Filled Price] {source}: {entry_price:,.8f} THB")
         else:
             print(
