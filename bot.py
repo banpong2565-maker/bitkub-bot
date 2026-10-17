@@ -215,6 +215,54 @@ def safe_float(value, default=0.0) -> float:
         return default
 
 
+def extract_buy_fill_details(order_result, order_info, fallback_price, requested_thb, fee_rate):
+    """Reconcile a BUY from Bitkub's acknowledgement and order-info history.
+
+    Bitkub order-info history records quote spend per fill and its execution
+    rate. Prefer a weighted average from those fills; use the acknowledgement's
+    receive quantity when available, otherwise estimate received quantity from
+    fill history after the configured trading fee.
+    """
+    order_result = order_result if isinstance(order_result, dict) else {}
+    order_info = order_info if isinstance(order_info, dict) else {}
+    history = order_info.get("history", [])
+    quote_spent = 0.0
+    gross_coin = 0.0
+    weighted_price = 0.0
+    if isinstance(history, list):
+        for fill in history:
+            if not isinstance(fill, dict):
+                continue
+            rate = safe_float(fill.get("rate"))
+            quote_amount = safe_float(fill.get("amount"))
+            if rate > 0 and quote_amount > 0:
+                quote_spent += quote_amount
+                gross_coin += quote_amount / rate
+    if quote_spent > 0 and gross_coin > 0:
+        weighted_price = quote_spent / gross_coin
+
+    entry_price = weighted_price or safe_float(
+        order_result.get("rate")
+        or order_result.get("rat")
+        or order_result.get("avg_price")
+        or order_result.get("avg")
+        or order_info.get("rate")
+        or order_info.get("rat")
+        or order_info.get("avg_price")
+        or order_info.get("avg")
+    ) or safe_float(fallback_price)
+
+    received = safe_float(order_result.get("rec"))
+    if received <= 0 and gross_coin > 0:
+        received = gross_coin * (1.0 - max(0.0, min(float(fee_rate), 1.0)))
+
+    actual_cost = safe_float(order_info.get("filled"))
+    if actual_cost <= 0:
+        actual_cost = quote_spent if quote_spent > 0 else safe_float(requested_thb)
+
+    return entry_price, received, actual_cost, bool(weighted_price)
+
+
 def get_ticker_volume_thb(ticker: dict) -> float:
     return max(
         safe_float(ticker.get("quoteVolume")),
@@ -2075,15 +2123,15 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
             prev["entry_price"] = weighted_entry
             prev["highest_price"] = max(prev.get("highest_price", weighted_entry), entry_price)
             prev["initial_amount"] = total_amount
-            prev["cost_thb"] = safe_float(prev.get("cost_thb", 0.0)) + amount_thb
+            prev["cost_thb"] = safe_float(prev.get("cost_thb", 0.0)) + actual_cost_thb
         else:
             # New position
             position_state[opportunity["coin"]] = {
                 "entry_price": entry_price,
                 "highest_price": entry_price,
                 "atr_at_entry": atr,
-                "initial_amount": coin_bought,
-                "cost_thb": amount_thb,
+                "initial_amount": new_amount,
+                "cost_thb": actual_cost_thb,
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "opened_at": datetime.now().isoformat(timespec="seconds"),
@@ -2198,47 +2246,57 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         info_result = {}
         if order_id:
             try:
-                order_info = client.get_order_info(opportunity["symbol"], order_id, "buy")
-                if isinstance(order_info, dict) and order_info.get("error") == 0:
-                    candidate_info = order_info.get("result", {})
+                order_info_response = client.get_order_info(opportunity["symbol"], order_id, "buy")
+                if isinstance(order_info_response, dict) and order_info_response.get("error") == 0:
+                    candidate_info = order_info_response.get("result", {})
                     if isinstance(candidate_info, dict):
                         info_result = candidate_info
                         print(
                             f"[BUY fill info] id={order_id} | "
                             f"status={info_result.get('status', 'unknown')} | "
-                            f"rat={info_result.get('rat', info_result.get('rate', 'n/a'))} | "
-                            f"rec={info_result.get('rec', 'n/a')}"
+                            f"filled={info_result.get('filled', 'n/a')} | "
+                            f"history_fills={len(info_result.get('history', [])) if isinstance(info_result.get('history', []), list) else 0}"
                         )
                 else:
-                    print(f"[BUY fill info] Order-info unavailable: {order_info.get('message', 'unknown response') if isinstance(order_info, dict) else 'invalid response'}")
+                    print(f"[BUY fill info] Order-info unavailable: {order_info_response.get('message', 'unknown response') if isinstance(order_info_response, dict) else 'invalid response'}")
             except Exception as fill_exc:
                 print(f"[BUY fill info] Order-info lookup failed: {fill_exc}")
 
-        actual_price = safe_float(
-            result.get("rate")
-            or result.get("rat")
-            or result.get("avg_price")
-            or result.get("avg")
-            or info_result.get("rate")
-            or info_result.get("rat")
-            or info_result.get("avg_price")
-            or info_result.get("avg")
+        actual_price, received_amount, actual_cost_thb, price_from_history = extract_buy_fill_details(
+            result, info_result, entry_price, amount_thb, config.TRADING_FEE_RATE
         )
         if actual_price > 0:
             entry_price = actual_price
-            print(f"[🔥 Filled Price] ใช้ราคา fill จากผลคำสั่งซื้อ: {entry_price:,.8f} THB")
+            exchange_price_available = any(
+                safe_float(candidate) > 0
+                for candidate in (
+                    result.get("rate"), result.get("rat"), result.get("avg_price"), result.get("avg"),
+                    info_result.get("rate"), info_result.get("rat"), info_result.get("avg_price"), info_result.get("avg"),
+                )
+            )
+            source = (
+                "weighted order history" if price_from_history
+                else "order response/info" if exchange_price_available
+                else "ticker fallback (not exchange-confirmed)"
+            )
+            print(f"[🔥 Filled Price] {source}: {entry_price:,.8f} THB")
         else:
-            # Fallback only when Bitkub does not expose a matched price.
-            # Make this visible so the position can be reconciled against the
-            # exchange trade history instead of silently treating it as exact.
             print(
-                f"[⚠️ BUY fill warning] ไม่พบราคา fill จริงจาก place-bid/order-info; "
-                f"ใช้ราคาอ้างอิง {entry_price:,.8f} THB ชั่วคราว "
-                f"(ตรวจสอบกับประวัติคำสั่งซื้อ Bitkub)"
+                f"[⚠️ BUY fill warning] No usable fill price; using ticker reference "
+                f"{entry_price:,.8f} THB temporarily (reconcile against Bitkub order history)"
             )
 
+        if actual_cost_thb <= 0:
+            actual_cost_thb = amount_thb
+        if received_amount > 0:
+            new_amount = received_amount
+        elif entry_price > 0:
+            new_amount = (actual_cost_thb / entry_price) * (1 - config.TRADING_FEE_RATE)
+        else:
+            print("[BUY fill warning] Cannot calculate coin quantity; skipping position accounting")
+            return
+
         server_day, _ = get_server_day_and_time(client)
-        new_amount = (amount_thb / entry_price) * (1 - config.TRADING_FEE_RATE)
         
         if config.ALLOW_ADD_TO_POSITION and opportunity["coin"] in position_state:
             prev = position_state[opportunity["coin"]]
@@ -2264,7 +2322,7 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         if not state_ref.get("supabase_position_id"):
             state_ref["supabase_position_id"] = _learning_open_position(
                 opportunity, entry_price, state_ref.get("initial_amount", new_amount),
-                state_ref.get("cost_thb", amount_thb), buy_fee=amount_thb * config.TRADING_FEE_RATE
+                state_ref.get("cost_thb", actual_cost_thb), buy_fee=actual_cost_thb * config.TRADING_FEE_RATE
             )
         try:
             if opportunity.get("prediction_id"):
@@ -2278,9 +2336,9 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
                 filled_price=entry_price,
                 requested_amount=amount_thb,
                 filled_amount=new_amount,
-                gross_value_thb=amount_thb,
-                fee_thb=amount_thb * config.TRADING_FEE_RATE,
-                net_value_thb=amount_thb - amount_thb * config.TRADING_FEE_RATE,
+                gross_value_thb=actual_cost_thb,
+                fee_thb=actual_cost_thb * config.TRADING_FEE_RATE,
+                net_value_thb=actual_cost_thb - actual_cost_thb * config.TRADING_FEE_RATE,
                 status="FILLED",
                 raw_result=result,
             )
