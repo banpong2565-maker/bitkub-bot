@@ -2191,17 +2191,51 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
             except Exception as e:
                 print(f"[⚠️ Trade log error] {e}")
             return
+        # A market-order acknowledgement can return rat=0 and no fill price.
+        # Query Bitkub's read-only order-info endpoint before falling back to
+        # the scan-time ticker, so recorded entry cost is as close to the fill
+        # as the exchange API allows. This does not place or retry any order.
+        info_result = {}
+        if order_id:
+            try:
+                order_info = client.get_order_info(opportunity["symbol"], order_id, "buy")
+                if isinstance(order_info, dict) and order_info.get("error") == 0:
+                    candidate_info = order_info.get("result", {})
+                    if isinstance(candidate_info, dict):
+                        info_result = candidate_info
+                        print(
+                            f"[BUY fill info] id={order_id} | "
+                            f"status={info_result.get('status', 'unknown')} | "
+                            f"rat={info_result.get('rat', info_result.get('rate', 'n/a'))} | "
+                            f"rec={info_result.get('rec', 'n/a')}"
+                        )
+                else:
+                    print(f"[BUY fill info] Order-info unavailable: {order_info.get('message', 'unknown response') if isinstance(order_info, dict) else 'invalid response'}")
+            except Exception as fill_exc:
+                print(f"[BUY fill info] Order-info lookup failed: {fill_exc}")
+
         actual_price = safe_float(
-            result.get("rate") or 
-            result.get("rat") or 
-            result.get("avg_price") or 
-            result.get("avg")
+            result.get("rate")
+            or result.get("rat")
+            or result.get("avg_price")
+            or result.get("avg")
+            or info_result.get("rate")
+            or info_result.get("rat")
+            or info_result.get("avg_price")
+            or info_result.get("avg")
         )
         if actual_price > 0:
             entry_price = actual_price
-            print(f"[🔥 Filled Price] ดึงราคา fill จริงจาก order_res ได้สำเร็จ: {entry_price:,.4f} THB")
+            print(f"[🔥 Filled Price] ใช้ราคา fill จากผลคำสั่งซื้อ: {entry_price:,.8f} THB")
         else:
-            print(f"[⚠️ Warning] ไม่สามารถดึงราคา fill จริงจาก order_res ได้ ใช้ราคา ticker: {entry_price:,.4f} THB")
+            # Fallback only when Bitkub does not expose a matched price.
+            # Make this visible so the position can be reconciled against the
+            # exchange trade history instead of silently treating it as exact.
+            print(
+                f"[⚠️ BUY fill warning] ไม่พบราคา fill จริงจาก place-bid/order-info; "
+                f"ใช้ราคาอ้างอิง {entry_price:,.8f} THB ชั่วคราว "
+                f"(ตรวจสอบกับประวัติคำสั่งซื้อ Bitkub)"
+            )
 
         server_day, _ = get_server_day_and_time(client)
         new_amount = (amount_thb / entry_price) * (1 - config.TRADING_FEE_RATE)
