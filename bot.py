@@ -2110,6 +2110,10 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
         net_buy_thb = amount_thb - fee
         paper_thb -= amount_thb
         coin_bought = net_buy_thb / entry_price
+        # Keep paper-trading position fields consistent with the LIVE path.
+        # These variables were previously referenced before assignment.
+        new_amount = coin_bought
+        actual_cost_thb = amount_thb
         paper_balances[opportunity["coin"]] = paper_balances.get(opportunity["coin"], 0.0) + coin_bought
         
         # Handle position state for dry run
@@ -2306,14 +2310,14 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
             prev["entry_price"] = weighted_entry
             prev["highest_price"] = max(prev.get("highest_price", weighted_entry), entry_price)
             prev["initial_amount"] = total_amount
-            prev["cost_thb"] = safe_float(prev.get("cost_thb", 0.0)) + amount_thb
+            prev["cost_thb"] = safe_float(prev.get("cost_thb", 0.0)) + actual_cost_thb
         else:
             position_state[opportunity["coin"]] = {
                 "entry_price": entry_price,
                 "highest_price": entry_price,
                 "atr_at_entry": atr,
                 "initial_amount": new_amount,
-                "cost_thb": amount_thb,
+                "cost_thb": actual_cost_thb,
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "opened_at": datetime.now().isoformat(timespec="seconds"),
