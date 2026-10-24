@@ -1,4 +1,5 @@
 import math
+import time
 from datetime import datetime, timezone
 import requests
 from urllib.parse import quote
@@ -24,6 +25,8 @@ class SupabaseLearning:
             else {}
         )
         self.db = DatabaseAwareness(self)
+        # One read-only batch cache prevents per-symbol REST queries during each scan.
+        self._prediction_outcome_cache = {"loaded_at": 0.0, "by_symbol": {}}
         if self.enabled:
             print(f"[Supabase] Learning enabled: {self.url}")
             self.db.refresh(force=True)
@@ -366,6 +369,89 @@ class SupabaseLearning:
         except Exception as e:
             print(f"[Supabase] prediction settlement error: {e}")
             return 0
+
+
+    def get_prediction_outcome_stats(self, symbol, refresh_seconds=900):
+        """Return read-only, settled prediction outcomes for a symbol.
+
+        This is shadow analysis only: it never changes a trading decision.
+        Results are batch-loaded and cached so scanning many symbols adds at
+        most one Supabase read per refresh interval.
+        """
+        if not self.enabled or not self.db.has_table("bot_prediction_outcomes"):
+            return None
+
+        now = time.monotonic()
+        cache = self._prediction_outcome_cache
+        if now - cache["loaded_at"] >= max(float(refresh_seconds), 60.0):
+            rows = self._request(
+                "GET", "bot_prediction_outcomes",
+                params={
+                    "select": "symbol,return_15m,return_60m,executed,status",
+                    "status": "eq.SETTLED",
+                    "order": "predicted_at.desc",
+                    "limit": "5000",
+                },
+                timeout=15,
+            )
+            if not isinstance(rows, list):
+                # Throttle retries after an outage so every symbol in this scan
+                # does not trigger another failed REST request.
+                cache["by_symbol"] = {}
+                cache["loaded_at"] = now
+                return None
+            grouped = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                key = str(row.get("symbol") or "").upper()
+                if not key:
+                    continue
+                grouped.setdefault(key, []).append(row)
+            cache["by_symbol"] = grouped
+            cache["loaded_at"] = now
+
+        records = cache["by_symbol"].get(str(symbol).upper(), [])
+        if not records:
+            return {
+                "sample_count": 0, "executed_count": 0, "not_executed_count": 0,
+                "avg_return_15m": None, "win_rate_15m": None,
+                "avg_return_60m": None, "win_rate_60m": None,
+                "executed_avg_return_60m": None, "not_executed_avg_return_60m": None,
+            }
+
+        def values(items, key):
+            return [self._num(item.get(key)) for item in items
+                    if self._num(item.get(key)) is not None]
+
+        def summary(items, key):
+            vals = values(items, key)
+            if not vals:
+                return None, None
+            return sum(vals) / len(vals), sum(1 for value in vals if value > 0) / len(vals)
+
+        ret15, win15 = summary(records, "return_15m")
+        ret60, win60 = summary(records, "return_60m")
+        executed = [r for r in records if r.get("executed") is True]
+        not_executed = [r for r in records if r.get("executed") is not True]
+        exec_ret60, _ = summary(executed, "return_60m")
+        skipped_ret60, _ = summary(not_executed, "return_60m")
+        sample_count = sum(
+            1 for row in records
+            if self._num(row.get("return_15m")) is not None
+            or self._num(row.get("return_60m")) is not None
+        )
+        return {
+            "sample_count": sample_count,
+            "executed_count": len(executed),
+            "not_executed_count": len(not_executed),
+            "avg_return_15m": ret15,
+            "win_rate_15m": win15,
+            "avg_return_60m": ret60,
+            "win_rate_60m": win60,
+            "executed_avg_return_60m": exec_ret60,
+            "not_executed_avg_return_60m": skipped_ret60,
+        }
 
     def health_check(self):
         """Check Supabase REST access and return a compact diagnostic."""

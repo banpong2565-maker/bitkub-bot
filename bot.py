@@ -1187,6 +1187,29 @@ def scan_market(client: BitkubClient, strategy, tickers: dict, asset_balances: d
             print(f"[DB-AWARENESS][WARN] Learning query failed for {symbol}; using neutral learning data")
             learning_stats = {"symbol": symbol.upper(), "trade_count": 0, "win_rate": None, "avg_pnl_rate": None}
         learning_score = learning.calculate_learning_score(learning_stats)
+        # Shadow-only use of settled historical outcomes: informative telemetry,
+        # deliberately excluded from final_score and all order decisions.
+        outcome_stats = (
+            learning.get_prediction_outcome_stats(symbol)
+            if config.LEARNING_ENABLED else None
+        )
+        if outcome_stats and outcome_stats.get("sample_count", 0) >= 5:
+            avg15 = outcome_stats.get("avg_return_15m")
+            avg60 = outcome_stats.get("avg_return_60m")
+            win60 = outcome_stats.get("win_rate_60m")
+            exec_avg60 = outcome_stats.get("executed_avg_return_60m")
+            fmt15 = f"{avg15 * 100:.2f}%" if avg15 is not None else "N/A"
+            fmt60 = f"{avg60 * 100:.2f}%" if avg60 is not None else "N/A"
+            fmt_win60 = f"{win60 * 100:.1f}%" if win60 is not None else "N/A"
+            fmt_exec60 = f"{exec_avg60 * 100:.2f}%" if exec_avg60 is not None else "N/A"
+            print(
+                f"[SHADOW-LEARNING] {symbol.upper()} "
+                f"n={outcome_stats['sample_count']} "
+                f"15m_avg={fmt15} 60m_avg={fmt60} 60m_win={fmt_win60} "
+                f"executed={outcome_stats['executed_count']} "
+                f"not_executed={outcome_stats['not_executed_count']} "
+                f"executed_60m_avg={fmt_exec60}"
+            )
         try:
             row = df_15m.iloc[-1].to_dict()
             row.update({"close": price, "spread_rate": spread_rate,
