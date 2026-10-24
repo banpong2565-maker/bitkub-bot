@@ -91,10 +91,16 @@ class ProfitVault:
     def _insert(self, event_type: str, amount: float, *, symbol=None, position_id=None,
                 reference_id=None, status="SUCCESS", fee=0.0, received_amount=None,
                 withdrawal_id=None, note=None, vault_balance=None) -> bool:
+        # Older ledgers used bigint position_id, while bot_positions.id is UUID.
+        # Preserve legacy numeric IDs and store UUIDs in the additive position_uuid column.
+        position_text = str(position_id).strip() if position_id is not None else ""
+        numeric_position_id = int(position_text) if position_text.isdigit() else None
+        position_uuid = position_text if position_text and not position_text.isdigit() else None
         payload = {
             "event_type": event_type,
             "symbol": symbol.upper() if symbol else None,
-            "position_id": position_id,
+            "position_id": numeric_position_id,
+            "position_uuid": position_uuid,
             "amount": round(float(amount), 8),
             "vault_balance": round(float(vault_balance if vault_balance is not None else self.balance()), 8),
             "status": status,
@@ -104,8 +110,33 @@ class ProfitVault:
             "reference_id": reference_id,
             "note": note,
         }
+        # Make each ledger event retry-safe. A previous attempt may have written
+        # PROFIT or COMPOUND before a later event failed; recognize that row on retry.
+        if reference_id:
+            existing = self._request(
+                "GET", "profit_vault_ledger",
+                params={"select": "id,event_type", "reference_id": f"eq.{reference_id}", "limit": "1"},
+            )
+            if isinstance(existing, list) and existing:
+                print(f"[ProfitVault] Ledger event already recorded: event={event_type}, reference_id={reference_id}")
+                return True
+
         rows = self._request("POST", "profit_vault_ledger", payload=payload)
-        return rows is not None
+        if not isinstance(rows, list) or not rows:
+            # A concurrent retry may have inserted the same reference between GET and
+            # POST. Re-check after failure; the unique index is the final duplicate guard.
+            if reference_id:
+                existing = self._request(
+                    "GET", "profit_vault_ledger",
+                    params={"select": "id,event_type", "reference_id": f"eq.{reference_id}", "limit": "1"},
+                )
+                if isinstance(existing, list) and existing:
+                    print(f"[ProfitVault] Ledger event confirmed after retry: event={event_type}, reference_id={reference_id}")
+                    return True
+            print("[ProfitVault][WARN] Ledger insert returned no row; verify migration, RLS, and key permissions")
+            return False
+        print(f"[ProfitVault] Ledger insert confirmed: event={event_type}, row_id={rows[0].get('id')}")
+        return True
 
     def _patch(self, row_id, payload) -> bool:
         if not self.enabled:
