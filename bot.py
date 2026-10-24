@@ -146,6 +146,12 @@ def load_state():
                 data = json.load(f)
             if isinstance(data, dict):
                 position_state = data.get("positions", {})
+                # Legacy state cannot prove whether cost_thb/entry_price came from
+                # an actual exchange fill or a balance-only restart estimate.
+                for _coin, _state in position_state.items():
+                    if isinstance(_state, dict) and "cost_basis_verified" not in _state:
+                        _state["cost_basis_verified"] = False
+                        _state["cost_basis_source"] = "legacy_state_unverified"
                 consecutive_losses = data.get("consecutive_losses", 0)
                 last_buy_date = data.get("last_buy_date", None)
                 paper_thb = data.get("paper_thb", 10000.0)
@@ -2233,6 +2239,8 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
                 "atr_at_entry": atr,
                 "initial_amount": new_amount,
                 "cost_thb": actual_cost_thb,
+                "cost_basis_verified": True,
+                "cost_basis_source": "buy_execution",
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "opened_at": datetime.now().isoformat(timespec="seconds"),
