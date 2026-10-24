@@ -1197,27 +1197,18 @@ def scan_market(client: BitkubClient, strategy, tickers: dict, asset_balances: d
             avg15 = outcome_stats.get("avg_return_15m")
             avg60 = outcome_stats.get("avg_return_60m")
             win60 = outcome_stats.get("win_rate_60m")
+            exec_avg60 = outcome_stats.get("executed_avg_return_60m")
+            fmt15 = f"{avg15 * 100:.2f}%" if avg15 is not None else "N/A"
+            fmt60 = f"{avg60 * 100:.2f}%" if avg60 is not None else "N/A"
+            fmt_win60 = f"{win60 * 100:.1f}%" if win60 is not None else "N/A"
+            fmt_exec60 = f"{exec_avg60 * 100:.2f}%" if exec_avg60 is not None else "N/A"
             print(
                 f"[SHADOW-LEARNING] {symbol.upper()} "
                 f"n={outcome_stats['sample_count']} "
-                f"15m_avg={avg15*100:.2f}% " if avg15 is not None else
-                f"[SHADOW-LEARNING] {symbol.upper()} n={outcome_stats['sample_count']} 15m_avg=N/A "
-            , end="")
-            print(
-                f"60m_avg={avg60*100:.2f}% " if avg60 is not None else "60m_avg=N/A ",
-                end=""
-            )
-            print(
-                f"60m_win={win60*100:.1f}% " if win60 is not None else "60m_win=N/A ",
-                end=""
-            )
-            print(
+                f"15m_avg={fmt15} 60m_avg={fmt60} 60m_win={fmt_win60} "
                 f"executed={outcome_stats['executed_count']} "
                 f"not_executed={outcome_stats['not_executed_count']} "
-                f"executed_60m_avg={outcome_stats['executed_avg_return_60m']*100:.2f}%"
-                if outcome_stats.get("executed_avg_return_60m") is not None
-                else f"executed={outcome_stats['executed_count']} "
-                     f"not_executed={outcome_stats['not_executed_count']} executed_60m_avg=N/A"
+                f"executed_60m_avg={fmt_exec60}"
             )
         try:
             row = df_15m.iloc[-1].to_dict()
