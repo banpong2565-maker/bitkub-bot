@@ -395,7 +395,10 @@ class SupabaseLearning:
                 timeout=15,
             )
             if not isinstance(rows, list):
-                # Do not cache errors; a later scan may recover after a transient outage.
+                # Throttle retries after an outage so every symbol in this scan
+                # does not trigger another failed REST request.
+                cache["by_symbol"] = {}
+                cache["loaded_at"] = now
                 return None
             grouped = {}
             for row in rows:
