@@ -1953,11 +1953,22 @@ def execute_sell(client, notifier, opportunity):
             net_profit = actual_receive - cost_basis_actual
             print(f"[💰 Actual SELL PnL] receive={actual_receive:,.4f} | fee={actual_fee:,.4f} | cost={cost_basis_actual:,.4f} | net={net_profit:,.4f} THB")
         pnl_rate_for_learning = (net_profit / safe_float(state.get("cost_thb", 0.0))) if safe_float(state.get("cost_thb", 0.0)) > 0 else 0.0
-        _learning_close_position(
-            state, opportunity, opportunity["price"], amount, value_thb,
-            actual_fee if actual_fee > 0 else value_thb * config.TRADING_FEE_RATE, net_profit,
-            pnl_rate_for_learning, reason
-        )
+        tracked_before_close = safe_float(state.get("initial_amount", 0.0))
+        total_cost_before_close = safe_float(state.get("cost_thb", 0.0))
+        remaining_before_close = max(tracked_before_close - amount, 0.0)
+        remaining_cost_before_close = max(total_cost_before_close - cost_basis_actual, 0.0)
+        partial_exit_actual = remaining_before_close > max(1e-8, tracked_before_close * 1e-6)
+        if not partial_exit_actual:
+            _learning_close_position(
+                state, opportunity, opportunity["price"], amount, value_thb,
+                actual_fee if actual_fee > 0 else value_thb * config.TRADING_FEE_RATE, net_profit,
+                pnl_rate_for_learning, reason
+            )
+        else:
+            print(
+                f"[POSITION PARTIAL EXIT] Keeping Supabase position open for {coin}: "
+                f"remaining={remaining_before_close:.8f}, remaining_cost={remaining_cost_before_close:.4f} THB"
+            )
         try:
             learning.order(
                 state.get("supabase_position_id"),
@@ -1982,9 +1993,8 @@ def execute_sell(client, notifier, opportunity):
         # only disposed of part of the tracked position (e.g. reserved balance).
         state_after_sell = position_state.get(coin, {})
         tracked_after_sell = safe_float(state_after_sell.get("initial_amount", 0.0))
-        total_cost_after_sell = safe_float(state_after_sell.get("cost_thb", 0.0))
-        remaining_amount = max(tracked_after_sell - amount, 0.0)
-        remaining_cost = max(total_cost_after_sell - cost_basis, 0.0)
+        remaining_amount = remaining_before_close
+        remaining_cost = remaining_cost_before_close
         dust_threshold = max(1e-8, tracked_after_sell * 1e-6)
         if remaining_amount > dust_threshold and remaining_cost > 0:
             state_after_sell["initial_amount"] = remaining_amount
