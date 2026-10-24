@@ -597,6 +597,10 @@ def sync_position_state(client: BitkubClient, asset_balances: dict, current_pric
                 "atr_at_entry": 0.0,
                 "cost_thb": amount * price / max(1.0 - config.TRADING_FEE_RATE, 1e-12),
                 "initial_amount": amount,
+                # Balance sync cannot prove historical entry price/cost. Block live
+                # sells until real cost basis is reconciled rather than inventing one.
+                "cost_basis_verified": False,
+                "cost_basis_source": "balance_sync_estimate",
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "mode": "normal",
@@ -1742,8 +1746,48 @@ def execute_sell(client, notifier, opportunity):
     coin = opportunity["coin"]
     reason = opportunity.get("reason", "unknown")
 
+    # Live sell safety: require a recorded cost basis and re-check the live bid.
+    # A last-traded ticker price is not a safe execution price for a market sell.
+    state_for_sell = position_state.get(coin, {})
+    tracked_amount = safe_float(state_for_sell.get("initial_amount", 0.0))
+    tracked_cost = safe_float(state_for_sell.get("cost_thb", 0.0))
+    if not config.DRY_RUN:
+        if state_for_sell.get("cost_basis_verified") is False or tracked_amount <= 0 or tracked_cost <= 0:
+            message = (
+                f"[🛑 SELL BLOCKED] {coin}: cost basis is not verified "
+                f"(tracked_amount={tracked_amount:.8f}, tracked_cost={tracked_cost:.4f}). "
+                "Reconcile the actual BUY fill before selling."
+            )
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: cost basis unknown", opportunity, message)
+            return
+        if amount > tracked_amount * 1.000001:
+            message = (
+                f"[🛑 SELL BLOCKED] {coin}: requested amount {amount:.8f} exceeds "
+                f"tracked position {tracked_amount:.8f}; refusing unsafe cost allocation."
+            )
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: quantity mismatch", opportunity, message)
+            return
+        try:
+            live_ticker = client.get_ticker(opportunity["symbol"])
+            live_bid = safe_float(live_ticker.get("highestBid")) or safe_float(live_ticker.get("highest_bid"))
+        except Exception as exc:
+            live_bid = 0.0
+            print(f"[🛑 SELL BLOCKED] {coin}: could not read live bid: {exc}")
+        if live_bid <= 0:
+            message = f"[🛑 SELL BLOCKED] {coin}: no valid live bid; no order submitted."
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: no live bid", opportunity, message)
+            return
+        opportunity["price"] = live_bid
+        value_thb = amount * live_bid
+
     # Final safety gate: never submit a sell below the configured NET profit target.
     cost_basis = position_cost_for_amount(coin, amount)
+    if cost_basis <= 0:
+        print(f"[🛑 SELL BLOCKED] {coin}: cost basis calculation returned {cost_basis:.4f} THB")
+        return
     allowed_profit, protected_profit, net_rate_check, min_required_price = profit_only_sell_check(
         cost_basis, opportunity["price"], amount, buy_fee=0.0, sell_fee_rate=config.TRADING_FEE_RATE
     )
@@ -1792,6 +1836,13 @@ def execute_sell(client, notifier, opportunity):
     # เทรดจริง (Live)
     current_order_type = config.ORDER_TYPE_SELL
     current_post_only = config.POST_ONLY
+    # Profit-only protection cannot guarantee the fill price of a market order.
+    # Use a limit order at/above the computed net-profit floor; an unfilled order
+    # leaves the position open instead of risking a loss on a fast-moving bid.
+    if PROFIT_ONLY_SELL_ENABLED:
+        current_order_type = "limit"
+        current_post_only = False
+        opportunity["price"] = max(safe_float(opportunity["price"]), min_required_price)
 
     is_ioc = False
     if current_order_type == "limit_ioc":
@@ -1842,8 +1893,15 @@ def execute_sell(client, notifier, opportunity):
 
         if order_status not in (None, "filled"):
             print(f"[⏳ SELL NOT FILLED] {opportunity['symbol'].upper()} order={order_id} status={order_status}")
-            # Minimal execution fallback: cancel the stale limit order and retry
-            # once at market price, but only after re-checking the profit-only gate.
+            if PROFIT_ONLY_SELL_ENABLED:
+                # Never convert a protected limit exit into a market sell: the
+                # bid can move between this check and the exchange matching engine.
+                notify_trade(
+                    notifier, "[LIVE] Sell not filled", opportunity,
+                    f"Order {order_id} status={order_status}. Protected limit remains the only allowed exit; no market retry."
+                )
+                return
+            # Legacy fallback only applies when profit-only protection is disabled.
             try:
                 if order_id:
                     cancel_res = client.cancel_order(opportunity["symbol"], str(order_id), "sell")
@@ -1914,7 +1972,23 @@ def execute_sell(client, notifier, opportunity):
             print(f"[Supabase] sell order log failed: {e}")
 
         consecutive_losses = 0
-        position_state.pop(coin, None)
+        # Keep residual inventory and its proportional cost basis if this sell
+        # only disposed of part of the tracked position (e.g. reserved balance).
+        state_after_sell = position_state.get(coin, {})
+        tracked_after_sell = safe_float(state_after_sell.get("initial_amount", 0.0))
+        total_cost_after_sell = safe_float(state_after_sell.get("cost_thb", 0.0))
+        remaining_amount = max(tracked_after_sell - amount, 0.0)
+        remaining_cost = max(total_cost_after_sell - cost_basis, 0.0)
+        dust_threshold = max(1e-8, tracked_after_sell * 1e-6)
+        if remaining_amount > dust_threshold and remaining_cost > 0:
+            state_after_sell["initial_amount"] = remaining_amount
+            state_after_sell["cost_thb"] = remaining_cost
+            print(
+                f"[POSITION PARTIAL EXIT] {coin}: sold={amount:.8f}, "
+                f"remaining={remaining_amount:.8f}, remaining_cost={remaining_cost:.4f} THB"
+            )
+        else:
+            position_state.pop(coin, None)
 
         save_state()
         mark_traded(opportunity["symbol"])
