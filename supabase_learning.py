@@ -27,6 +27,15 @@ class SupabaseLearning:
         if self.enabled:
             print(f"[Supabase] Learning enabled: {self.url}")
             self.db.refresh(force=True)
+        else:
+            reasons = []
+            if not config.LEARNING_ENABLED:
+                reasons.append("LEARNING_ENABLED=False")
+            if not self.url:
+                reasons.append("SUPABASE_URL missing")
+            if not self.key:
+                reasons.append("SUPABASE_KEY missing")
+            print(f"[Supabase][WARN] Learning disabled: {', '.join(reasons) or 'configuration incomplete'}")
 
     @staticmethod
     def _num(value, default=None):
@@ -89,9 +98,16 @@ class SupabaseLearning:
             if not safe_payload:
                 print(f"[DB-AWARENESS][WARN] No compatible columns for {table}; write skipped")
                 return [] if return_json else False
+            # Request the inserted row so a 2xx response with no returned row is
+            # not silently reported as a successful insert.
             data = self._request("POST", table, payload=safe_payload,
-                                 prefer="return=representation" if return_json else "return=minimal")
-            return data if return_json else data is not None
+                                 prefer="return=representation")
+            inserted = isinstance(data, list) and bool(data)
+            if not inserted:
+                print(f"[DB-AWARENESS][WARN] POST {table} returned no inserted row; verify RLS/policies and schema")
+                return data if return_json and isinstance(data, list) else ([] if return_json else False)
+            print(f"[DB-AWARENESS] POST {table} inserted_rows={len(data)}")
+            return data if return_json else True
         except Exception as exc:
             print(f"[DB-AWARENESS][ERROR] POST {table} skipped: {exc}")
             return [] if return_json else False
@@ -100,8 +116,18 @@ class SupabaseLearning:
         try:
             safe_payload = self.db.filter_payload(table, payload)
             if not safe_payload:
+                print(f"[DB-AWARENESS][WARN] PATCH {table} skipped: no compatible columns")
                 return False
-            return self._request("PATCH", table, payload=safe_payload, params=params) is not None
+            # PATCH without a representation can return 204 even when the filter
+            # matched zero rows. Verify that Supabase returned the updated row.
+            data = self._request("PATCH", table, payload=safe_payload, params=params,
+                                 prefer="return=representation")
+            updated = isinstance(data, list) and bool(data)
+            if not updated:
+                print(f"[DB-AWARENESS][WARN] PATCH {table} matched no visible row; verify ID, RLS, and filters")
+                return False
+            print(f"[DB-AWARENESS] PATCH {table} updated_rows={len(data)}")
+            return True
         except Exception as exc:
             print(f"[DB-AWARENESS][ERROR] PATCH {table} skipped: {exc}")
             return False
