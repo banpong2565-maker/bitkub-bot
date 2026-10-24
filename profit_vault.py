@@ -110,8 +110,29 @@ class ProfitVault:
             "reference_id": reference_id,
             "note": note,
         }
+        # Make each ledger event retry-safe. A previous attempt may have written
+        # PROFIT or COMPOUND before a later event failed; recognize that row on retry.
+        if reference_id:
+            existing = self._request(
+                "GET", "profit_vault_ledger",
+                params={"select": "id,event_type", "reference_id": f"eq.{reference_id}", "limit": "1"},
+            )
+            if isinstance(existing, list) and existing:
+                print(f"[ProfitVault] Ledger event already recorded: event={event_type}, reference_id={reference_id}")
+                return True
+
         rows = self._request("POST", "profit_vault_ledger", payload=payload)
         if not isinstance(rows, list) or not rows:
+            # A concurrent retry may have inserted the same reference between GET and
+            # POST. Re-check after failure; the unique index is the final duplicate guard.
+            if reference_id:
+                existing = self._request(
+                    "GET", "profit_vault_ledger",
+                    params={"select": "id,event_type", "reference_id": f"eq.{reference_id}", "limit": "1"},
+                )
+                if isinstance(existing, list) and existing:
+                    print(f"[ProfitVault] Ledger event confirmed after retry: event={event_type}, reference_id={reference_id}")
+                    return True
             print("[ProfitVault][WARN] Ledger insert returned no row; verify migration, RLS, and key permissions")
             return False
         print(f"[ProfitVault] Ledger insert confirmed: event={event_type}, row_id={rows[0].get('id')}")
