@@ -29,7 +29,9 @@ PROFIT_ONLY_USE_BID_PRICE = True
 # (fees + execution buffer), the bot keeps holding until a bearish signal
 # appears.  This lets strong trends run instead of taking small profits early.
 HOLD_UNTIL_SELL_SIGNAL = True
-HOLD_UNTIL_SELL_SIGNAL_MIN_NET_RATE = 0.0
+# Require at least 1% realized net profit after fees and the execution buffer;
+# honor a stricter deployment SELL_MIN_NET_PROFIT_RATE when configured.
+HOLD_UNTIL_SELL_SIGNAL_MIN_NET_RATE = max(config.SELL_MIN_NET_PROFIT_RATE, 0.01)
 
 def profit_only_sell_check(entry_cost, sell_price, quantity, buy_fee=0.0, sell_fee_rate=0.0):
     if not PROFIT_ONLY_SELL_ENABLED or entry_cost <= 0 or sell_price <= 0 or quantity <= 0:
