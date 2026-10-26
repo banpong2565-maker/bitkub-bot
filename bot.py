@@ -29,7 +29,9 @@ PROFIT_ONLY_USE_BID_PRICE = True
 # (fees + execution buffer), the bot keeps holding until a bearish signal
 # appears.  This lets strong trends run instead of taking small profits early.
 HOLD_UNTIL_SELL_SIGNAL = True
-HOLD_UNTIL_SELL_SIGNAL_MIN_NET_RATE = 0.0
+# Require at least 1% realized net profit after fees and the execution buffer;
+# honor a stricter deployment SELL_MIN_NET_PROFIT_RATE when configured.
+HOLD_UNTIL_SELL_SIGNAL_MIN_NET_RATE = max(config.SELL_MIN_NET_PROFIT_RATE, 0.01)
 
 def profit_only_sell_check(entry_cost, sell_price, quantity, buy_fee=0.0, sell_fee_rate=0.0):
     if not PROFIT_ONLY_SELL_ENABLED or entry_cost <= 0 or sell_price <= 0 or quantity <= 0:
@@ -146,6 +148,12 @@ def load_state():
                 data = json.load(f)
             if isinstance(data, dict):
                 position_state = data.get("positions", {})
+                # Legacy state cannot prove whether cost_thb/entry_price came from
+                # an actual exchange fill or a balance-only restart estimate.
+                for _coin, _state in position_state.items():
+                    if isinstance(_state, dict) and "cost_basis_verified" not in _state:
+                        _state["cost_basis_verified"] = False
+                        _state["cost_basis_source"] = "legacy_state_unverified"
                 consecutive_losses = data.get("consecutive_losses", 0)
                 last_buy_date = data.get("last_buy_date", None)
                 paper_thb = data.get("paper_thb", 10000.0)
@@ -597,6 +605,10 @@ def sync_position_state(client: BitkubClient, asset_balances: dict, current_pric
                 "atr_at_entry": 0.0,
                 "cost_thb": amount * price / max(1.0 - config.TRADING_FEE_RATE, 1e-12),
                 "initial_amount": amount,
+                # Balance sync cannot prove historical entry price/cost. Block live
+                # sells until real cost basis is reconciled rather than inventing one.
+                "cost_basis_verified": False,
+                "cost_basis_source": "balance_sync_estimate",
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "mode": "normal",
@@ -1742,8 +1754,48 @@ def execute_sell(client, notifier, opportunity):
     coin = opportunity["coin"]
     reason = opportunity.get("reason", "unknown")
 
+    # Live sell safety: require a recorded cost basis and re-check the live bid.
+    # A last-traded ticker price is not a safe execution price for a market sell.
+    state_for_sell = position_state.get(coin, {})
+    tracked_amount = safe_float(state_for_sell.get("initial_amount", 0.0))
+    tracked_cost = safe_float(state_for_sell.get("cost_thb", 0.0))
+    if not config.DRY_RUN:
+        if state_for_sell.get("cost_basis_verified") is False or tracked_amount <= 0 or tracked_cost <= 0:
+            message = (
+                f"[🛑 SELL BLOCKED] {coin}: cost basis is not verified "
+                f"(tracked_amount={tracked_amount:.8f}, tracked_cost={tracked_cost:.4f}). "
+                "Reconcile the actual BUY fill before selling."
+            )
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: cost basis unknown", opportunity, message)
+            return
+        if amount > tracked_amount * 1.000001:
+            message = (
+                f"[🛑 SELL BLOCKED] {coin}: requested amount {amount:.8f} exceeds "
+                f"tracked position {tracked_amount:.8f}; refusing unsafe cost allocation."
+            )
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: quantity mismatch", opportunity, message)
+            return
+        try:
+            live_ticker = client.get_ticker(opportunity["symbol"])
+            live_bid = safe_float(live_ticker.get("highestBid")) or safe_float(live_ticker.get("highest_bid"))
+        except Exception as exc:
+            live_bid = 0.0
+            print(f"[🛑 SELL BLOCKED] {coin}: could not read live bid: {exc}")
+        if live_bid <= 0:
+            message = f"[🛑 SELL BLOCKED] {coin}: no valid live bid; no order submitted."
+            print(message)
+            notify_trade(notifier, "[LIVE] Sell blocked: no live bid", opportunity, message)
+            return
+        opportunity["price"] = live_bid
+        value_thb = amount * live_bid
+
     # Final safety gate: never submit a sell below the configured NET profit target.
     cost_basis = position_cost_for_amount(coin, amount)
+    if cost_basis <= 0:
+        print(f"[🛑 SELL BLOCKED] {coin}: cost basis calculation returned {cost_basis:.4f} THB")
+        return
     allowed_profit, protected_profit, net_rate_check, min_required_price = profit_only_sell_check(
         cost_basis, opportunity["price"], amount, buy_fee=0.0, sell_fee_rate=config.TRADING_FEE_RATE
     )
@@ -1792,6 +1844,13 @@ def execute_sell(client, notifier, opportunity):
     # เทรดจริง (Live)
     current_order_type = config.ORDER_TYPE_SELL
     current_post_only = config.POST_ONLY
+    # Profit-only protection cannot guarantee the fill price of a market order.
+    # Use a limit order at/above the computed net-profit floor; an unfilled order
+    # leaves the position open instead of risking a loss on a fast-moving bid.
+    if PROFIT_ONLY_SELL_ENABLED:
+        current_order_type = "limit"
+        current_post_only = False
+        opportunity["price"] = max(safe_float(opportunity["price"]), min_required_price)
 
     is_ioc = False
     if current_order_type == "limit_ioc":
@@ -1842,8 +1901,15 @@ def execute_sell(client, notifier, opportunity):
 
         if order_status not in (None, "filled"):
             print(f"[⏳ SELL NOT FILLED] {opportunity['symbol'].upper()} order={order_id} status={order_status}")
-            # Minimal execution fallback: cancel the stale limit order and retry
-            # once at market price, but only after re-checking the profit-only gate.
+            if PROFIT_ONLY_SELL_ENABLED:
+                # Never convert a protected limit exit into a market sell: the
+                # bid can move between this check and the exchange matching engine.
+                notify_trade(
+                    notifier, "[LIVE] Sell not filled", opportunity,
+                    f"Order {order_id} status={order_status}. Protected limit remains the only allowed exit; no market retry."
+                )
+                return
+            # Legacy fallback only applies when profit-only protection is disabled.
             try:
                 if order_id:
                     cancel_res = client.cancel_order(opportunity["symbol"], str(order_id), "sell")
@@ -1889,11 +1955,22 @@ def execute_sell(client, notifier, opportunity):
             net_profit = actual_receive - cost_basis_actual
             print(f"[💰 Actual SELL PnL] receive={actual_receive:,.4f} | fee={actual_fee:,.4f} | cost={cost_basis_actual:,.4f} | net={net_profit:,.4f} THB")
         pnl_rate_for_learning = (net_profit / safe_float(state.get("cost_thb", 0.0))) if safe_float(state.get("cost_thb", 0.0)) > 0 else 0.0
-        _learning_close_position(
-            state, opportunity, opportunity["price"], amount, value_thb,
-            actual_fee if actual_fee > 0 else value_thb * config.TRADING_FEE_RATE, net_profit,
-            pnl_rate_for_learning, reason
-        )
+        tracked_before_close = safe_float(state.get("initial_amount", 0.0))
+        total_cost_before_close = safe_float(state.get("cost_thb", 0.0))
+        remaining_before_close = max(tracked_before_close - amount, 0.0)
+        remaining_cost_before_close = max(total_cost_before_close - cost_basis_actual, 0.0)
+        partial_exit_actual = remaining_before_close > max(1e-8, tracked_before_close * 1e-6)
+        if not partial_exit_actual:
+            _learning_close_position(
+                state, opportunity, opportunity["price"], amount, value_thb,
+                actual_fee if actual_fee > 0 else value_thb * config.TRADING_FEE_RATE, net_profit,
+                pnl_rate_for_learning, reason
+            )
+        else:
+            print(
+                f"[POSITION PARTIAL EXIT] Keeping Supabase position open for {coin}: "
+                f"remaining={remaining_before_close:.8f}, remaining_cost={remaining_cost_before_close:.4f} THB"
+            )
         try:
             learning.order(
                 state.get("supabase_position_id"),
@@ -1914,7 +1991,22 @@ def execute_sell(client, notifier, opportunity):
             print(f"[Supabase] sell order log failed: {e}")
 
         consecutive_losses = 0
-        position_state.pop(coin, None)
+        # Keep residual inventory and its proportional cost basis if this sell
+        # only disposed of part of the tracked position (e.g. reserved balance).
+        state_after_sell = position_state.get(coin, {})
+        tracked_after_sell = safe_float(state_after_sell.get("initial_amount", 0.0))
+        remaining_amount = remaining_before_close
+        remaining_cost = remaining_cost_before_close
+        dust_threshold = max(1e-8, tracked_after_sell * 1e-6)
+        if remaining_amount > dust_threshold and remaining_cost > 0:
+            state_after_sell["initial_amount"] = remaining_amount
+            state_after_sell["cost_thb"] = remaining_cost
+            print(
+                f"[POSITION PARTIAL EXIT] {coin}: sold={amount:.8f}, "
+                f"remaining={remaining_amount:.8f}, remaining_cost={remaining_cost:.4f} THB"
+            )
+        else:
+            position_state.pop(coin, None)
 
         save_state()
         mark_traded(opportunity["symbol"])
@@ -2159,6 +2251,8 @@ def execute_buy(client, notifier, opportunity, thb_balance, total_value):
                 "atr_at_entry": atr,
                 "initial_amount": new_amount,
                 "cost_thb": actual_cost_thb,
+                "cost_basis_verified": True,
+                "cost_basis_source": "buy_execution",
                 "tp1_sold": False,
                 "tp2_sold": False,
                 "opened_at": datetime.now().isoformat(timespec="seconds"),
